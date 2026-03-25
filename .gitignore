@@ -1,4 +1,6 @@
 data/
+outputs/
+*.zip
 *.pdf
 __pycache__/
 *.py[cod]

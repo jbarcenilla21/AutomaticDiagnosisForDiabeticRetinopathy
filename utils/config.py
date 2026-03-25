@@ -10,4 +10,4 @@ num_epochs      = 50
 img_height      = 224       # input image height
 img_width       = 224       # input image width
 num_channels    = 3         # RGB images
-num_classes     = 5         # DR severity grades: 0 (No DR), 1, 2, 3, 4
+num_classes     = 2         # binary: 0 (No DR), 1 (DR)

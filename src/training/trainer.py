@@ -83,10 +83,10 @@ def train_model(
                 with torch.set_grad_enabled(phase == 'train'):
                     with autocast(device_type=device.type, enabled=use_amp):
                         outputs = model(inputs)
-                        # Cast to float32: BCELoss can produce NaN in float16
-                        # when probabilities are very close to 0 or 1.
-                        probs = outputs.flatten().float()
-                        loss  = criterion(probs, labels)
+                    # Compute loss in float32 outside autocast — BCELoss is
+                    # unsafe under autocast when the model outputs probabilities.
+                    probs = outputs.flatten().float()
+                    loss  = criterion(probs, labels)
 
                     if phase == 'train':
                         scaler.scale(loss).backward()

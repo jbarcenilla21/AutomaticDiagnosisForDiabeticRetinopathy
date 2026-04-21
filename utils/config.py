@@ -22,8 +22,8 @@ class Config:
     test_csv        = base_dir / "data" / "test.csv"    
     data_dir        = base_dir / "data"
     images_dir      = base_dir / "data" / "images"
+    output_path     = base_dir / "results" / "outputs"
 
-    output_path     = base_dir / "results" / "outputs" / 
 
     # ---- Data parameters ----
     img_height   = 224          # EfficientNet / DenseNet / ViT-compatible

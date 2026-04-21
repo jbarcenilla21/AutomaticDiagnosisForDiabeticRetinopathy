@@ -5,20 +5,30 @@
 Architecture choices
 ────────────────────
 BaseModel
-  Wraps any torchvision / timm model.  The last ``unfreeze_n`` layer groups are
-  unfrozen for fine-tuning; the rest stay frozen.  The classification head is
-  replaced with a single linear output (raw logit for BCEWithLogitsLoss).
+    Wraps any torchvision / timm model.  The last ``unfreeze_n`` layer groups are
+    unfrozen for fine-tuning; the rest stay frozen.  The classification head is
+    replaced with a single linear output (raw logit for BCEWithLogitsLoss).
+    Supported backbones (torchvision):
+    efficientnet_b2, efficientnet_b3
+    densenet121
+    mobilenet_v3_large
+    vgg16, vgg16_bn, vgg19, vgg19_bn
+    resnet50, resnext50_32x4d
+ 
+    Any timm model is also supported if timm is installed.
 
 EnsembleModel
-  Combines three complementary architectures:
-    • EfficientNet-B2  — compact, accurate, good on medical images
-    • DenseNet-121     — dense feature reuse, strong gradient flow
-    • TinyViT-21M      — vision transformer, captures global context
-
-  Predictions are averaged at the soft-probability level (after sigmoid).
-  Each backbone has its own head; the ensemble wrapper is parameter-free.
-
-  Note: TinyViT requires the ``timm`` library (pip install timm).
+    Heterogeneous soft-voting ensemble.  Accepts a list of:
+        • Backbone name strings  →  wrapped with BaseModel automatically.
+        • "CustomCNN"            →  instantiates CustomCNN from model_components.
+        • Pre-built nn.Module    →  used as-is (head already replaced externally).
+    
+    All members are assumed to output raw logits.  The ensemble wrapper applies
+    sigmoid to each member's logit and returns the weighted-mean probability.
+    Trainer detects EnsembleModel and switches to BCELoss automatically.
+    
+    Default backbone set (backward-compatible):
+        EfficientNet-B2 + DenseNet-121 + TinyViT-21M-224
 """
 
 from __future__ import annotations
@@ -71,6 +81,9 @@ def _replace_head(model: nn.Module, backbone_name: str, out_features: int = 1) -
     elif "mobilenet_v3" in name:
         in_feat = model.classifier[-1].in_features
         model.classifier[-1] = nn.Linear(in_feat, out_features)
+    elif "vgg" in name:
+        in_feat = model.classifier[6].in_features
+        model.classifier[6] = nn.Linear(in_feat, out_features)
     elif "vit" in name or "swin" in name:
         # timm models expose a unified head attribute
         in_feat = model.head.in_features
@@ -98,6 +111,8 @@ def _get_layer_groups(model: nn.Module, backbone_name: str) -> list[nn.Module]:
             model.classifier,
         ]
     elif "mobilenet_v3" in name:
+        return [model.features, model.classifier]
+    elif "vgg" in name:
         return [model.features, model.classifier]
     elif "tiny_vit" in name:
         # TinyViT models in timm use 'stages' instead of 'blocks'
@@ -147,6 +162,8 @@ class BaseModel(nn.Module):
             m = models.efficientnet_b2(weights=weights_arg)
         elif name_lower == "efficientnet_b3":
             m = models.efficientnet_b3(weights=weights_arg)
+        elif name_lower == "vgg16":
+            m = models.vgg16(weights="IMAGENET1K_V1" if pretrained else None)
         elif name_lower == "densenet121":
             m = models.densenet121(weights=weights_arg)
         elif name_lower == "mobilenet_v3_large":
@@ -201,91 +218,154 @@ class EnsembleModel(nn.Module):
     Each backbone produces a raw logit; sigmoid converts it to a probability.
     The ensemble output is the mean probability across all members.
 
-    Architecture selection rationale
-    ──────────────────────────────────
-    EfficientNet-B2   Efficient compound scaling; very sample-efficient.
-    DenseNet-121      Dense connectivity improves gradient flow on small datasets.
-    TinyViT-21M       Global self-attention complements local CNN features.
-
     Args:
-        unfreeze_n:  Layer groups to unfreeze per backbone.
-        pretrained:  Load ImageNet weights for all members.
-        weights:     Optional list [w0, w1, w2] for weighted averaging (uniform
-                     averaging if None).
+        backbone_names: List whose elements can be:
+                        • A backbone name string accepted by BaseModel
+                          (e.g. ``"efficientnet_b2"``, ``"vgg16_bn"``).
+                        • The special string ``"CustomCNN"`` to auto-instantiate
+                          the lightweight custom architecture.
+                        • A pre-built ``nn.Module`` instance whose forward()
+                          returns a raw logit of shape ``(B, 1)``.
+                        Defaults to the original three-member ensemble.
+        unfreeze_n:     Layer groups to unfreeze per string-based backbone member.
+                        Forced to ``-1`` when ``pretrained=False``.
+        pretrained:     Load ImageNet weights for all string-based members.
+        weights:        Optional ``[w0, w1, …]`` for weighted averaging.
+                        Uniform weighting when ``None``.
+ 
+    Forward returns:
+        Weighted-mean sigmoid probability, shape ``(B, 1)``.
     """
 
+    _DEFAULT_BACKBONES = [
+        "efficientnet_b2",
+        "densenet121",
+        "tiny_vit_21m_224.dist_in22k_ft_in1k",
+    ]
+ 
     def __init__(
         self,
-        unfreeze_n: int = cfg.unfreeze_layers,
-        pretrained: bool = True,
+        backbone_names: list | None = None,
+        unfreeze_n: int             = cfg.unfreeze_layers,
+        pretrained: bool            = True,
         weights: list[float] | None = None,
     ):
         super().__init__()
-
-        # ── Build each backbone ───────────────────────────────────────────────
-        self.eff_net = BaseModel(
-            backbone_name="efficientnet_b2",
-            unfreeze_n=unfreeze_n,
-            pretrained=pretrained,
-        )
-        self.dense_net = BaseModel(
-            backbone_name="densenet121",
-            unfreeze_n=unfreeze_n,
-            pretrained=pretrained,
-        )
-
-        # TinyViT via timm; fall back to MobileNetV3 if timm is absent
-        if TIMM_AVAILABLE:
-            self.tiny_vit = BaseModel(
-                backbone_name="tiny_vit_21m_224.dist_in22k_ft_in1k",
-                unfreeze_n=unfreeze_n,
-                pretrained=pretrained,
-            )
-        else:
-            print("[EnsembleModel] Using MobileNetV3 as TinyViT fallback.")
-            self.tiny_vit = BaseModel(
-                backbone_name="mobilenet_v3_large",
-                unfreeze_n=unfreeze_n,
-                pretrained=pretrained,
-            )
-
+ 
+        if backbone_names is None:
+            backbone_names = list(self._DEFAULT_BACKBONES)
+ 
+        # If training from scratch, every parameter should be trainable
+        effective_unfreeze = -1 if not pretrained else unfreeze_n
+ 
+        # ── Build member list ─────────────────────────────────────────────────
+        members: list[nn.Module] = []
+        names:   list[str]       = []
+ 
+        for spec in backbone_names:
+            if isinstance(spec, nn.Module):
+                # Pre-built model passed directly — use as-is
+                members.append(spec)
+                names.append(type(spec).__name__)
+ 
+            elif isinstance(spec, str) and spec == "CustomCNN":
+                from src.model_components import CustomCNN
+                m = CustomCNN(img_size=cfg.img_height)
+                members.append(m)
+                names.append("CustomCNN")
+ 
+            elif isinstance(spec, str):
+                # Any torchvision / timm backbone
+                # Handle timm fallback gracefully for TinyViT
+                _spec = spec
+                if (not TIMM_AVAILABLE and
+                        "tiny_vit" in spec.lower()):
+                    print(
+                        "[EnsembleModel] timm unavailable — replacing "
+                        f"'{spec}' with MobileNetV3."
+                    )
+                    _spec = "mobilenet_v3_large"
+                m = BaseModel(
+                    backbone_name=_spec,
+                    unfreeze_n=effective_unfreeze,
+                    pretrained=pretrained,
+                )
+                members.append(m)
+                names.append(_spec)
+ 
+            else:
+                raise TypeError(
+                    f"backbone_names elements must be str or nn.Module, "
+                    f"got {type(spec)}."
+                )
+ 
+        self.members_list  = nn.ModuleList(members)
+        self.member_names  = names          # human-readable for diagnostics
+ 
         # ── Averaging weights ─────────────────────────────────────────────────
+        n = len(members)
         if weights is not None:
+            if len(weights) != n:
+                raise ValueError(
+                    f"len(weights)={len(weights)} != number of members={n}"
+                )
             w = torch.tensor(weights, dtype=torch.float32)
             w = w / w.sum()
         else:
-            w = torch.ones(3) / 3.0
-        self.register_buffer("ens_weights", w)   # saved with state_dict
-
-        total = (
-            sum(p.numel() for p in self.parameters() if p.requires_grad)
+            w = torch.ones(n, dtype=torch.float32) / float(n)
+        self.register_buffer("ens_weights", w)   # persisted in state_dict
+ 
+        total_trainable = sum(
+            p.numel() for p in self.parameters() if p.requires_grad
         )
-        print(f"[EnsembleModel] Total trainable params: {total:,}")
-
+        print(
+            f"[EnsembleModel] Members: {self.member_names}\n"
+            f"[EnsembleModel] Total trainable params: {total_trainable:,}"
+        )
+ 
     # ── Forward ───────────────────────────────────────────────────────────────
-
+ 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Return weighted-mean sigmoid probability. Shape: (B, 1)."""
-        p0 = torch.sigmoid(self.eff_net(x))    # (B, 1)
-        p1 = torch.sigmoid(self.dense_net(x))  # (B, 1)
-        p2 = torch.sigmoid(self.tiny_vit(x))   # (B, 1)
-
-        w = self.ens_weights  # (3,)
-        out = w[0] * p0 + w[1] * p1 + w[2] * p2  # (B, 1)
-        return out
-
+        """Weighted-mean sigmoid probability.  Shape: (B, 1)."""
+        out = torch.zeros(x.size(0), 1, device=x.device, dtype=x.dtype)
+        for i, member in enumerate(self.members_list):
+            logit = member(x)                             # (B, 1)
+            out   = out + self.ens_weights[i] * torch.sigmoid(logit)
+        return out   # probabilities in [0, 1]
+ 
     # ── Utilities ─────────────────────────────────────────────────────────────
-
+ 
+    def member_logits(self, x: torch.Tensor) -> list[torch.Tensor]:
+        """Raw logits from each member — for per-backbone diagnostics."""
+        return [member(x) for member in self.members_list]
+ 
     def unfreeze_all_members(self):
-        """Unfreeze every parameter in every backbone (use after warm-up)."""
-        for member in [self.eff_net, self.dense_net, self.tiny_vit]:
-            member.unfreeze_all()
+        """Unfreeze every parameter in every member (call after warm-up)."""
+        for member in self.members_list:
+            if hasattr(member, "unfreeze_all"):
+                member.unfreeze_all()          # BaseModel convenience method
+            else:
+                for p in member.parameters():
+                    p.requires_grad = True
         total = sum(p.numel() for p in self.parameters() if p.requires_grad)
         print(f"[EnsembleModel] All members unfrozen. Trainable: {total:,}")
-
-    def members(self) -> list[BaseModel]:
-        return [self.eff_net, self.dense_net, self.tiny_vit]
-
-    def member_logits(self, x: torch.Tensor) -> list[torch.Tensor]:
-        """Return individual raw logits for per-backbone diagnostics."""
-        return [self.eff_net(x), self.dense_net(x), self.tiny_vit(x)]
+ 
+    def members(self) -> list[nn.Module]:
+        return list(self.members_list)
+ 
+    # ── Backward-compatibility aliases ────────────────────────────────────────
+ 
+    @property
+    def eff_net(self) -> nn.Module:
+        """Alias: first member (historically EfficientNet-B2)."""
+        return self.members_list[0]
+ 
+    @property
+    def dense_net(self) -> nn.Module:
+        """Alias: second member (historically DenseNet-121)."""
+        return self.members_list[1] if len(self.members_list) > 1 else None
+ 
+    @property
+    def tiny_vit(self) -> nn.Module:
+        """Alias: third member (historically TinyViT)."""
+        return self.members_list[2] if len(self.members_list) > 2 else None

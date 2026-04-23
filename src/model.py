@@ -2,39 +2,40 @@
 # model.py  —  BaseModel (single fine-tuned backbone) + EnsembleModel
 # =============================================================================
 """
-Architecture choices
-────────────────────
+Architecture overview
+─────────────────────
 BaseModel
-    Wraps any torchvision / timm model.  The last ``unfreeze_n`` layer groups are
-    unfrozen for fine-tuning; the rest stay frozen.  The classification head is
-    replaced with a single linear output (raw logit for BCEWithLogitsLoss).
-    Supported backbones (torchvision):
-    efficientnet_b2, efficientnet_b3
-    densenet121
-    mobilenet_v3_large
-    vgg16, vgg16_bn, vgg19, vgg19_bn
-    resnet50, resnext50_32x4d
- 
-    Any timm model is also supported if timm is installed.
+    Wraps any torchvision / timm model.  The last ``unfreeze_n`` layer groups
+    are unfrozen; the rest stay frozen.  The classification head is replaced
+    with a single linear output (raw logit for BCEWithLogitsLoss / FocalLoss).
+
+    Supported torchvision backbones:
+        efficientnet_b2, efficientnet_b3, densenet121,
+        mobilenet_v3_large, vgg16, vgg16_bn, resnet50, resnext50_32x4d
+
+    Any timm model is also supported when timm is installed.
 
 EnsembleModel
-    Heterogeneous soft-voting ensemble.  Accepts a list of:
-        • Backbone name strings  →  wrapped with BaseModel automatically.
-        • "Custom_VGG"           →  instantiates Custom_VGG from model_components.
-        • Pre-built nn.Module    →  used as-is (head already replaced externally).
-    
-    All members are assumed to output raw logits.  The ensemble wrapper applies
-    sigmoid to each member's logit and returns the weighted-mean probability.
-    Trainer detects EnsembleModel and switches to BCELoss automatically.
-    
-    Default backbone set (backward-compatible):
-        EfficientNet-B2 + DenseNet-121 + TinyViT-21M-224
+    Heterogeneous soft-voting ensemble.  Accepts a list of backbone spec strings,
+    the special string "Custom_VGG", or pre-built nn.Module instances.
+
+    Multi-scale forward pass:
+        Model 0 → interpolated to ensemble_scales[0] = 224 (global context)
+        Model 1 → interpolated to ensemble_scales[1] = 384 (mid-scale)
+        Model 2 → interpolated to ensemble_scales[2] = 512 (fine lesions)
+
+    Ensemble weights are LEARNABLE (nn.Parameter with Softmax normalisation),
+    so the model learns which scale/backbone is most reliable.
+
+    predict_tta(): performs N augmented forward passes (random flips/rotations)
+    and returns the mean probability — used at test time.
 """
 
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torchvision import models
 
 try:
@@ -44,18 +45,16 @@ except ImportError:
     TIMM_AVAILABLE = False
     print(
         "[model.py] WARNING: 'timm' not installed.  "
-        "TinyViT will be replaced by a MobileNetV3 fallback.\n"
+        "TinyViT will be replaced by MobileNetV3.\n"
         "  Install with:  pip install timm"
     )
 
 from utils.config import Config as cfg
-import torch.nn.functional as F
 
 
-
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # Utility helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 
 def _count_params(model: nn.Module) -> str:
     total     = sum(p.numel() for p in model.parameters())
@@ -66,7 +65,6 @@ def _count_params(model: nn.Module) -> str:
 def _replace_head(model: nn.Module, backbone_name: str, out_features: int = 1) -> nn.Module:
     """Replace the classification head of common torchvision architectures."""
     name = backbone_name.lower()
-
     if "efficientnet" in name:
         in_feat = model.classifier[1].in_features
         model.classifier = nn.Sequential(
@@ -86,12 +84,11 @@ def _replace_head(model: nn.Module, backbone_name: str, out_features: int = 1) -
         in_feat = model.classifier[6].in_features
         model.classifier[6] = nn.Linear(in_feat, out_features)
     elif "vit" in name or "swin" in name:
-        # timm models expose a unified head attribute
         in_feat = model.head.in_features
         model.head = nn.Linear(in_feat, out_features)
     else:
         raise ValueError(
-            f"Unknown backbone '{backbone_name}'. "
+            f"Unknown backbone '{backbone_name}'.  "
             "Add a head-replacement branch or subclass BaseModel."
         )
     return model
@@ -116,44 +113,39 @@ def _get_layer_groups(model: nn.Module, backbone_name: str) -> list[nn.Module]:
     elif "vgg" in name:
         return [model.features, model.classifier]
     elif "tiny_vit" in name:
-        # TinyViT models in timm use 'stages' instead of 'blocks'
         return list(model.stages) + [model.head]
     elif "vit" in name or "swin" in name:
-        # Standard ViT/Swin models in timm use 'blocks'
         return list(model.blocks) + [model.head]
     else:
-        # generic fallback: treat children as groups
         return list(model.children())
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # BaseModel  —  single fine-tuned backbone
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 
 class BaseModel(nn.Module):
     """Single pretrained backbone fine-tuned for binary DR classification.
 
     Args:
-        backbone_name: One of ``efficientnet_b2``, ``densenet121``,
-                       ``mobilenet_v3_large``, or any timm model name.
+        backbone_name: e.g. ``"efficientnet_b2"``, ``"densenet121"``,
+                       or any timm model name.
         unfreeze_n:    Number of layer groups (from the end) to leave trainable.
-                       Set to ``-1`` to unfreeze the entire network.
-        pretrained:    Load ImageNet weights.  False → random init (Custom track).
+                       -1 → unfreeze the entire network (Custom track).
+        pretrained:    Load ImageNet weights.  False → random init.
     """
 
     def __init__(
         self,
-        backbone_name: str = "efficientnet_b2",
-        unfreeze_n: int = cfg.unfreeze_layers,
-        pretrained: bool = True,
+        backbone_name: str  = "efficientnet_b2",
+        unfreeze_n:    int  = cfg.unfreeze_layers,
+        pretrained:    bool = True,
     ):
         super().__init__()
         self.backbone_name = backbone_name
-        self.model = self._build_backbone(backbone_name, pretrained)
+        self.model         = self._build_backbone(backbone_name, pretrained)
         self._freeze_and_unfreeze(unfreeze_n)
         print(f"[BaseModel] {backbone_name} | {_count_params(self.model)}")
-
-    # ── Construction helpers ──────────────────────────────────────────────────
 
     def _build_backbone(self, name: str, pretrained: bool) -> nn.Module:
         weights_arg = "IMAGENET1K_V1" if pretrained else None
@@ -170,8 +162,9 @@ class BaseModel(nn.Module):
         elif name_lower == "mobilenet_v3_large":
             m = models.mobilenet_v3_large(weights=weights_arg)
         elif TIMM_AVAILABLE:
+            # timm models already set num_classes at creation
             m = timm.create_model(name, pretrained=pretrained, num_classes=1)
-            return m   # timm heads already replaced
+            return m
         else:
             raise ValueError(
                 f"Backbone '{name}' requires timm.  "
@@ -183,60 +176,58 @@ class BaseModel(nn.Module):
 
     def _freeze_and_unfreeze(self, unfreeze_n: int):
         if unfreeze_n == -1:
-            return   # train everything
+            return   # train everything from scratch
 
-        # Freeze all first
+        # Freeze all parameters first
         for p in self.model.parameters():
             p.requires_grad = False
 
         # Unfreeze the last unfreeze_n layer groups
         groups = _get_layer_groups(self.model, self.backbone_name)
-        print(f"[BaseModel] Total layer groups: {len(groups)}. Unfreezing last {unfreeze_n}.")
+        print(f"[BaseModel] Total groups: {len(groups)}.  Unfreezing last {unfreeze_n}.")
         for group in groups[-unfreeze_n:]:
             for p in group.parameters():
                 p.requires_grad = True
 
-    # ── Forward ───────────────────────────────────────────────────────────────
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.model(x)   # raw logit → (B, 1)
 
-    # ── Convenience ───────────────────────────────────────────────────────────
-
     def unfreeze_all(self):
-        """Unfreeze the full network (useful after initial warm-up)."""
+        """Unfreeze the full network (call after initial warm-up phase)."""
         for p in self.model.parameters():
             p.requires_grad = True
         print(f"[BaseModel] All layers unfrozen. {_count_params(self.model)}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# EnsembleModel  —  EfficientNet-B2 + DenseNet-121 + TinyViT
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# EnsembleModel  —  Heterogeneous multi-scale soft-voting ensemble
+# =============================================================================
 
 class EnsembleModel(nn.Module):
-    """Soft-voting ensemble of three complementary CNN / ViT backbones.
+    """Multi-scale heterogeneous soft-voting ensemble.
 
-    Each backbone produces a raw logit; sigmoid converts it to a probability.
-    The ensemble output is the mean probability across all members.
+    Each member receives the input at a DIFFERENT resolution, encouraging
+    complementary feature extraction:
+
+        Member 0  →  interpolated to ensemble_scales[0]  (224 — global context)
+        Member 1  →  interpolated to ensemble_scales[1]  (384 — mid-scale)
+        Member 2  →  interpolated to ensemble_scales[2]  (512 — fine lesions)
+
+    Each member outputs a raw logit.  sigmoid converts it to a probability.
+    The ensemble output is the LEARNABLE-WEIGHTED mean probability across members.
+
+    Ensemble weights (``ens_weights``) are ``nn.Parameter`` values; Softmax is
+    applied in forward() so they always sum to 1 and stay positive.  This
+    allows the network to learn which backbone / scale is most reliable.
 
     Args:
-        backbone_names: List whose elements can be:
-                        • A backbone name string accepted by BaseModel
-                          (e.g. ``"efficientnet_b2"``, ``"vgg16_bn"``).
-                        • The special string ``"Custom_VGG"`` to auto-instantiate
-                          the lightweight custom architecture.
-                        • A pre-built ``nn.Module`` instance whose forward()
-                          returns a raw logit of shape ``(B, 1)``.
-                        Defaults to the original three-member ensemble.
-        unfreeze_n:     Layer groups to unfreeze per string-based backbone member.
-                        Forced to ``-1`` when ``pretrained=False``.
-        pretrained:     Load ImageNet weights for all string-based members.
-        weights:        Optional ``[w0, w1, …]`` for weighted averaging.
-                        Uniform weighting when ``None``.
- 
-    Forward returns:
-        Weighted-mean sigmoid probability, shape ``(B, 1)``.
+        backbone_names: List of backbone specs (str / ``"Custom_VGG"`` / nn.Module).
+                        Defaults to EfficientNet-B2 + DenseNet-121 + TinyViT.
+        unfreeze_n:     Layer groups to unfreeze per string-based member.
+                        Forced to -1 when pretrained=False.
+        pretrained:     Load ImageNet weights for string-based members.
+        weights:        Optional initial weights [w0, w1, ...].  Uniform if None.
+                        These are the raw (pre-softmax) values of ens_weights.
     """
 
     _DEFAULT_BACKBONES = [
@@ -244,139 +235,198 @@ class EnsembleModel(nn.Module):
         "densenet121",
         "tiny_vit_21m_224.dist_in22k_ft_in1k",
     ]
- 
+
     def __init__(
         self,
-        backbone_names: list | None = None,
-        unfreeze_n: int             = cfg.unfreeze_layers,
-        pretrained: bool            = True,
-        weights: list[float] | None = None,
+        backbone_names: list | None          = None,
+        unfreeze_n:     int                  = cfg.unfreeze_layers,
+        pretrained:     bool                 = True,
+        weights:        list[float] | None   = None,
     ):
         super().__init__()
- 
+
         if backbone_names is None:
             backbone_names = list(self._DEFAULT_BACKBONES)
- 
-        # If training from scratch, every parameter should be trainable
+
+        # When training from scratch every parameter must be trainable
         effective_unfreeze = -1 if not pretrained else unfreeze_n
- 
+
         # ── Build member list ─────────────────────────────────────────────────
         members: list[nn.Module] = []
         names:   list[str]       = []
- 
+
         for spec in backbone_names:
             if isinstance(spec, nn.Module):
-                # Pre-built model passed directly — use as-is
                 members.append(spec)
                 names.append(type(spec).__name__)
- 
-            elif isinstance(spec, str) and spec == "Custom_VGG":
+
+            elif isinstance(spec, str) and spec.lower() == "custom_vgg":
                 from src.model_components import Custom_VGG
                 m = Custom_VGG(img_size=cfg.img_height)
                 members.append(m)
                 names.append("Custom_VGG")
- 
+
             elif isinstance(spec, str):
-                # Any torchvision / timm backbone
-                # Handle timm fallback gracefully for TinyViT
+                # Handle missing timm for TinyViT gracefully
                 _spec = spec
-                if (not TIMM_AVAILABLE and
-                        "tiny_vit" in spec.lower()):
-                    print(
-                        "[EnsembleModel] timm unavailable — replacing "
-                        f"'{spec}' with MobileNetV3."
-                    )
+                if not TIMM_AVAILABLE and "tiny_vit" in spec.lower():
+                    print(f"[EnsembleModel] timm unavailable — replacing '{spec}' with MobileNetV3.")
                     _spec = "mobilenet_v3_large"
                 m = BaseModel(
-                    backbone_name=_spec,
-                    unfreeze_n=effective_unfreeze,
-                    pretrained=pretrained,
+                    backbone_name = _spec,
+                    unfreeze_n    = effective_unfreeze,
+                    pretrained    = pretrained,
                 )
                 members.append(m)
                 names.append(_spec)
- 
+
             else:
                 raise TypeError(
-                    f"backbone_names elements must be str or nn.Module, "
-                    f"got {type(spec)}."
+                    f"backbone_names elements must be str or nn.Module, got {type(spec)}."
                 )
- 
-        self.members_list  = nn.ModuleList(members)
-        self.member_names  = names          # human-readable for diagnostics
- 
-        # ── Averaging weights ─────────────────────────────────────────────────
+
+        self.members_list = nn.ModuleList(members)
+        self.member_names = names      # human-readable labels for diagnostics
+
+        # ── Learnable ensemble weights (nn.Parameter, Softmax in forward) ─────
         n = len(members)
         if weights is not None:
             if len(weights) != n:
-                raise ValueError(
-                    f"len(weights)={len(weights)} != number of members={n}"
-                )
+                raise ValueError(f"len(weights)={len(weights)} != num members={n}")
             w = torch.tensor(weights, dtype=torch.float32)
-            w = w / w.sum()
         else:
-            w = torch.ones(n, dtype=torch.float32) / float(n)
-        self.register_buffer("ens_weights", w)   # persisted in state_dict
- 
-        total_trainable = sum(
-            p.numel() for p in self.parameters() if p.requires_grad
-        )
-        print(
-            f"[EnsembleModel] Members: {self.member_names}\n"
-            f"[EnsembleModel] Total trainable params: {total_trainable:,}"
-        )
- 
-    # ── Forward ───────────────────────────────────────────────────────────────
- 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Weighted-mean sigmoid probability.  Shape: (B, 1).
-           Each model recibes a different scale of the same image for 
-           multi-scale inference"""
-        out = torch.zeros(x.size(0), 1, device=x.device, dtype=x.dtype)
-        resolutions = cfg.ensemble_res # [128, 256, 512]
-        for i, member in enumerate(self.members_list):
-            # 1. Resize input for this member's expected resolution
-            target_res = resolutions[i%len(resolutions)]
-            x_res = F.interpolate(x, size=(target_res, target_res), 
-                                 mode='bilinear', align_corners=False)
+            # Start with uniform weights (all zeros → softmax gives 1/n each)
+            w = torch.zeros(n, dtype=torch.float32)
+        # nn.Parameter → included in model.parameters() and optimiser updates
+        self.ens_weights = nn.Parameter(w)
 
-            # 2. Forward
-            logit = member(x_res)                          # (B, 1)
-            out   = out + self.ens_weights[i] * torch.sigmoid(logit)
-        return out   # probabilities in [0, 1]
- 
-    # ── Utilities ─────────────────────────────────────────────────────────────
- 
+        total_trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        print(
+            f"[EnsembleModel] Members   : {self.member_names}\n"
+            f"[EnsembleModel] Scales    : {cfg.ensemble_scales}\n"
+            f"[EnsembleModel] Trainable : {total_trainable:,}"
+        )
+
+    # ── Forward ───────────────────────────────────────────────────────────────
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Multi-scale weighted-mean probability.  Shape: (B, 1).
+
+        Each member receives the input resized to its designated resolution
+        (from cfg.ensemble_scales).  Learnable Softmax weights control the
+        contribution of each member to the final probability.
+        """
+        # Normalise learnable weights with Softmax so they sum to 1
+        w = torch.softmax(self.ens_weights, dim=0)   # shape (n_members,)
+
+        out = torch.zeros(x.size(0), 1, device=x.device, dtype=x.dtype)
+
+        for i, member in enumerate(self.members_list):
+            # Select the scale assigned to this member (cycling if needed)
+            target_res = cfg.ensemble_scales[i % len(cfg.ensemble_scales)]
+
+            # Resize input to this member's expected resolution
+            x_res = F.interpolate(
+                x, size=(target_res, target_res),
+                mode="bilinear", align_corners=False,
+            )
+
+            logit = member(x_res)                          # (B, 1) raw logit
+            prob  = torch.sigmoid(logit)                   # (B, 1) probability
+            out   = out + w[i] * prob
+
+        return out   # weighted-mean probability in [0, 1]
+
+    # ── Test-Time Augmentation ─────────────────────────────────────────────────
+
+    @torch.no_grad()
+    def predict_tta(
+        self,
+        x:        torch.Tensor,
+        n_passes: int = cfg.num_tta,
+    ) -> torch.Tensor:
+        """Run N augmented forward passes and return the mean probability.
+
+        Augmentations applied in tensor space (no PIL conversion):
+            • Random horizontal flip (50%)
+            • Random vertical flip   (50%)
+            • Small random 90° rotation (25% each direction)
+
+        Args:
+            x:        Input batch (B, 3, H, W) already on the correct device.
+            n_passes: Number of TTA passes.  1 → deterministic single pass.
+
+        Returns:
+            Mean probability tensor (B, 1).
+        """
+        self.eval()
+        prob_sum = torch.zeros(x.size(0), 1, device=x.device)
+
+        for _ in range(n_passes):
+            x_aug = x.clone()
+
+            # Random horizontal flip
+            if torch.rand(1).item() > 0.5:
+                x_aug = torch.flip(x_aug, dims=[3])
+
+            # Random vertical flip
+            if torch.rand(1).item() > 0.5:
+                x_aug = torch.flip(x_aug, dims=[2])
+
+            # Random 90° rotation (keeps retinal structures realistic)
+            k = torch.randint(0, 4, (1,)).item()
+            if k > 0:
+                x_aug = torch.rot90(x_aug, k=k, dims=[2, 3])
+
+            prob_sum = prob_sum + self.forward(x_aug)
+
+        return prob_sum / n_passes   # (B, 1) mean probability
+
+    # ── Diagnostics ───────────────────────────────────────────────────────────
+
     def member_logits(self, x: torch.Tensor) -> list[torch.Tensor]:
-        """Raw logits from each member — for per-backbone diagnostics."""
-        return [member(x) for member in self.members_list]
- 
+        """Raw logits from each member — for per-backbone AUC diagnostics.
+
+        NOTE: Each member receives the input at its designated scale,
+        matching the behaviour of forward().
+        """
+        logits = []
+        for i, member in enumerate(self.members_list):
+            target_res = cfg.ensemble_scales[i % len(cfg.ensemble_scales)]
+            x_res      = F.interpolate(
+                x, size=(target_res, target_res),
+                mode="bilinear", align_corners=False,
+            )
+            logits.append(member(x_res))
+        return logits
+
     def unfreeze_all_members(self):
         """Unfreeze every parameter in every member (call after warm-up)."""
         for member in self.members_list:
             if hasattr(member, "unfreeze_all"):
-                member.unfreeze_all()          # BaseModel convenience method
+                member.unfreeze_all()
             else:
                 for p in member.parameters():
                     p.requires_grad = True
         total = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        print(f"[EnsembleModel] All members unfrozen. Trainable: {total:,}")
- 
+        print(f"[EnsembleModel] All members unfrozen.  Trainable: {total:,}")
+
     def members(self) -> list[nn.Module]:
         return list(self.members_list)
- 
-    # ── Backward-compatibility aliases ────────────────────────────────────────
- 
+
+    # ── Backward-compatible property aliases ──────────────────────────────────
+
     @property
     def eff_net(self) -> nn.Module:
-        """Alias: first member (historically EfficientNet-B2)."""
+        """First member (historically EfficientNet-B2)."""
         return self.members_list[0]
- 
+
     @property
     def dense_net(self) -> nn.Module:
-        """Alias: second member (historically DenseNet-121)."""
+        """Second member (historically DenseNet-121)."""
         return self.members_list[1] if len(self.members_list) > 1 else None
- 
+
     @property
     def tiny_vit(self) -> nn.Module:
-        """Alias: third member (historically TinyViT)."""
+        """Third member (historically TinyViT)."""
         return self.members_list[2] if len(self.members_list) > 2 else None

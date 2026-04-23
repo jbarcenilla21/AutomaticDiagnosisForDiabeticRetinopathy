@@ -62,6 +62,23 @@ def apply_clahe_green(image: np.ndarray) -> np.ndarray:
  
     return sk_util.img_as_float(img_out) if is_float else img_out
 
+def apply_clahe_red(image: np.ndarray) -> np.ndarray:
+    """Apply CLAHE to the red channel of an RGB image (uint8 or float64).
+
+    Args:
+        image: H×W×3 array, dtype float64 in [0,1] OR uint8 in [0,255].
+
+    Returns:
+        Same shape/dtype array with the red channel histogram-equalised.
+    """
+    is_float = image.dtype != np.uint8
+    img_u8   = sk_util.img_as_ubyte(np.clip(image, 0, 1)) if is_float else image.copy()
+ 
+    clahe    = cv2.createCLAHE(clipLimit=cfg.clahe_clip, tileGridSize=cfg.clahe_grid)
+    img_out  = img_u8.copy()
+    img_out[:, :, 0] = clahe.apply(img_u8[:, :, 0])
+
+    return sk_util.img_as_float(img_out) if is_float else img_out
 
 # -----------------------------------------------------------------------------
 # Custom transform classes  (all operate on sample dicts)
@@ -97,6 +114,7 @@ class CropByEye:
         image=image[miny:maxy,minx:maxx,...]
         return {'image': image, 'eye': eye, 'label' : label}
 
+
 class Rescale:
     """Resize so the shortest side equals output_size (int) or exact (h, w)."""
 
@@ -120,6 +138,14 @@ class CLAHEGreenChannel:
 
     def __call__(self, sample: dict) -> dict:
         image = apply_clahe_green(sample["image"])
+        return {"image": image, "eye": sample["eye"], "label": sample["label"]}
+
+
+class CLAHERedChannel:
+    """Apply CLAHE to the red channel to enhance DR lesion visibility."""
+
+    def __call__(self, sample: dict) -> dict:
+        image = apply_clahe_red(sample["image"])
         return {"image": image, "eye": sample["eye"], "label": sample["label"]}
 
 
@@ -270,6 +296,7 @@ def build_train_transforms(
     rigid:          bool    = cfg.aug_rigid,
     regularize:     bool    = cfg.aug_regularize,
     clahe:          bool    = cfg.aug_clahe,
+    ben_graham:     bool    = cfg.aug_ben_graham,
     intensity:      float   = cfg.aug_intensity,
 ) -> transforms.Compose:
     """Build the augmented training pipeline.
@@ -306,6 +333,8 @@ def build_train_transforms(
     ]
     if clahe:
         steps.append(CLAHEGreenChannel())
+    if ben_graham:
+        steps.append(CLAHERedChannel())
     steps.append(RandomCrop(img_size))
     if rigid:
         steps += [
@@ -340,6 +369,21 @@ def build_eval_transforms(
         steps.append(CLAHEGreenChannel())
     steps += [CenterCrop(img_size), ToTensor(), Normalize()]
     return transforms.Compose(steps)
+
+def build_tta_transforms(intensity=0.5):
+    """
+    Aleatory transforms for a TTA. 
+    Should use less agressive transforms to avoid distorisonate the results.
+    """
+    return transforms.Compose([
+        transforms.Resize((cfg.img_height, cfg.img_width)),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomVerticalFlip(p=0.5),
+        transforms.RandomRotation(15),
+        transforms.ColorJitter(brightness=0.1, contrast=0.1),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
 
 
 # -----------------------------------------------------------------------------

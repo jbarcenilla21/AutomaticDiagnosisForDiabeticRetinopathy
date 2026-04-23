@@ -39,6 +39,7 @@ from colorama import Fore, Style, init
 
 from utils.config import Config as cfg
 from src.model import EnsembleModel
+from src.model_components import FocalLoss
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -83,7 +84,7 @@ class Trainer:
         init(autoreset=True)
 
         # ── Detect model output type ──────────────────────────────────────────
-        #   EnsembleModel → probabilities → BCELoss
+        #   EnsembleModel → probabilities → FocalLoss
         #   Everything else → raw logits  → BCEWithLogitsLoss
         self._is_ensemble = isinstance(model, EnsembleModel)
 
@@ -94,8 +95,8 @@ class Trainer:
         print(f"[Trainer] pos_weight = {pos_weight:.4f}")
 
         if self._is_ensemble:
-            self.criterion = nn.BCELoss(weight=pw)
-            print("[Trainer] Loss: BCELoss  (EnsembleModel returns probabilities)")
+            self.criterion = FocalLoss(weight=pw)
+            print("[Trainer] Loss: FocalLoss (EnsembleModel returns probabilities)")
         else:
             self.criterion = nn.BCEWithLogitsLoss(pos_weight=pw)
             print("[Trainer] Loss: BCEWithLogitsLoss  (model returns raw logits)")
@@ -180,12 +181,7 @@ class Trainer:
         context = torch.enable_grad() if is_train else torch.no_grad()
         with context:
             tag       = "train" if is_train else "val  "
-            batch_bar = tqdm(
-                loader,
-                bar_format=cfg.bar_format,
-                ascii="░█",
-                desc=f"{Fore.WHITE}{tag}",
-            )
+            batch_bar = tqdm(loader, desc=f"[{tag}]", leave=False)
             for batch in batch_bar:
                 inputs = batch["image"].to(self.device)
                 labels = batch["label"].to(self.device).float()
@@ -332,6 +328,7 @@ class Trainer:
         self,
         test_loader: DataLoader,
         output_path: str,
+        num_tta: int,
     ) -> np.ndarray:
         """Run inference on the unlabelled test set and save scores to CSV.
 
@@ -340,32 +337,40 @@ class Trainer:
         Args:
             test_loader:  DataLoader for the test split (labels are -1).
             output_path:  Destination path for the output CSV.
+            num_tta:      Number of TTA iterations if 0 doesn't apply.
 
         Returns:
             numpy array of shape (N, 1) with DR scores in [0, 1].
         """
         self.model.eval()
+
+        all_tta_scores = np.zeros((len(test_loader), 1))
         all_scores: list[float] = []
+        num_tta = max(1, num_tta)
 
-        with torch.no_grad():
-            for batch in test_loader:
-                inputs = batch["image"].to(self.device)
-                if self._is_ensemble:
-                    probs = self.model(inputs).squeeze(1)
-                else:
-                    probs = torch.sigmoid(self.model(inputs)).squeeze(1)
-                all_scores.extend(probs.cpu().tolist())
+        print(f"[test_inference] Start inferene with {num_tta} iterations...")
 
-        scores = np.array(all_scores, dtype=float).reshape(-1, 1)
-        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        for i in range(num_tta):
+            current_pass_scores = []
+            with torch.no_grad():
+                for batch in test_loader:
+                    inputs = batch["image"].to(self.device)
+                    if self._is_ensemble:
+                        probs = self.model(inputs).squeeze(1)
+                    else:
+                        probs = torch.sigmoid(self.model(inputs)).squeeze(1)
+                    current_pass_scores.extend(probs.cpu().tolist())
+            all_tta_scores += np.array(current_pass_scores).reshape(-1, 1)
+
+        final_scores = all_tta_scores / num_tta
         with open(output_path, mode="w", newline="") as f:
-            csv.writer(f).writerows(scores)
+            csv.writer(f).writerows(final_scores)
 
         print(
-            f"[Trainer] Saved {len(scores)} scores → {output_path}\n"
-            f"          Range: [{scores.min():.4f}, {scores.max():.4f}]"
+            f"[Trainer] Saved {len(final_scores)} scores → {output_path}\n"
+            f"          Range: [{final_scores.min():.4f}, {final_scores.max():.4f}]"
         )
-        return scores
+        return final_scores
 
     # ─────────────────────────────────────────────────────────────────────────
     # Checkpoint utilities

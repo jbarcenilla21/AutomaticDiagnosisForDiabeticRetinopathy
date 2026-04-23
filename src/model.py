@@ -20,7 +20,7 @@ BaseModel
 EnsembleModel
     Heterogeneous soft-voting ensemble.  Accepts a list of:
         • Backbone name strings  →  wrapped with BaseModel automatically.
-        • "CustomCNN"            →  instantiates CustomCNN from model_components.
+        • "Custom_VGG"           →  instantiates Custom_VGG from model_components.
         • Pre-built nn.Module    →  used as-is (head already replaced externally).
     
     All members are assumed to output raw logits.  The ensemble wrapper applies
@@ -49,6 +49,7 @@ except ImportError:
     )
 
 from utils.config import Config as cfg
+import torch.nn.functional as F
 
 
 
@@ -190,6 +191,7 @@ class BaseModel(nn.Module):
 
         # Unfreeze the last unfreeze_n layer groups
         groups = _get_layer_groups(self.model, self.backbone_name)
+        print(f"[BaseModel] Total layer groups: {len(groups)}. Unfreezing last {unfreeze_n}.")
         for group in groups[-unfreeze_n:]:
             for p in group.parameters():
                 p.requires_grad = True
@@ -222,7 +224,7 @@ class EnsembleModel(nn.Module):
         backbone_names: List whose elements can be:
                         • A backbone name string accepted by BaseModel
                           (e.g. ``"efficientnet_b2"``, ``"vgg16_bn"``).
-                        • The special string ``"CustomCNN"`` to auto-instantiate
+                        • The special string ``"Custom_VGG"`` to auto-instantiate
                           the lightweight custom architecture.
                         • A pre-built ``nn.Module`` instance whose forward()
                           returns a raw logit of shape ``(B, 1)``.
@@ -268,11 +270,11 @@ class EnsembleModel(nn.Module):
                 members.append(spec)
                 names.append(type(spec).__name__)
  
-            elif isinstance(spec, str) and spec == "CustomCNN":
-                from src.model_components import CustomCNN
-                m = CustomCNN(img_size=cfg.img_height)
+            elif isinstance(spec, str) and spec == "Custom_VGG":
+                from src.model_components import Custom_VGG
+                m = Custom_VGG(img_size=cfg.img_height)
                 members.append(m)
-                names.append("CustomCNN")
+                names.append("Custom_VGG")
  
             elif isinstance(spec, str):
                 # Any torchvision / timm backbone
@@ -326,10 +328,19 @@ class EnsembleModel(nn.Module):
     # ── Forward ───────────────────────────────────────────────────────────────
  
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Weighted-mean sigmoid probability.  Shape: (B, 1)."""
+        """Weighted-mean sigmoid probability.  Shape: (B, 1).
+           Each model recibes a different scale of the same image for 
+           multi-scale inference"""
         out = torch.zeros(x.size(0), 1, device=x.device, dtype=x.dtype)
+        resolutions = cfg.ensemble_res # [128, 256, 512]
         for i, member in enumerate(self.members_list):
-            logit = member(x)                             # (B, 1)
+            # 1. Resize input for this member's expected resolution
+            target_res = resolutions[i%len(resolutions)]
+            x_res = F.interpolate(x, size=(target_res, target_res), 
+                                 mode='bilinear', align_corners=False)
+
+            # 2. Forward
+            logit = member(x_res)                          # (B, 1)
             out   = out + self.ens_weights[i] * torch.sigmoid(logit)
         return out   # probabilities in [0, 1]
  

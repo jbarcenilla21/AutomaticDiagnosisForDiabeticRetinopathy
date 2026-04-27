@@ -1,13 +1,13 @@
 """Transform classes for the Retinopathy dataset.
 
 All transforms are callable objects that accept and return a sample dict:
-    {'image': np.ndarray (HxWxC float64), 'eye': int, 'label': int/tensor}
+    {'image': np.ndarray (HxWxC), 'eye': int, 'label': int/tensor}
 
-Two families:
-- Custom transforms  : operate directly on numpy arrays (skimage-style).
-- TV* wrappers       : bridge numpy <-> PIL to reuse torchvision transforms.
-
-Pipeline order:  CropByEye -> Rescale -> RandomCrop/CenterCrop -> [augmentation] -> ToTensor -> Normalize
+Pipeline order:
+  Train: BenGraham -> CropByEye -> Rescale -> RandomCrop -> augmentation
+         -> RandomCutout -> ToTensor -> PerImageNormalize
+  Val:   BenGraham -> CropByEye -> Rescale -> CenterCrop
+         -> ToTensor -> PerImageNormalize
 """
 
 import numpy as np
@@ -19,16 +19,88 @@ from torchvision import transforms
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Retinal-specific preprocessing
+# ─────────────────────────────────────────────────────────────────────────────
+
+class BenGraham:
+    """Ben Graham fundus illumination normalization.
+
+    Subtracts the local average color and maps the background to 50% gray.
+    This maximizes contrast for microaneurysms and exudates while suppressing
+    vignetting and inter-camera illumination variance.
+
+    Must be the FIRST transform (operates on uint8 HxWxC numpy arrays).
+
+    Args:
+        sigma: Gaussian blur std deviation for local average. Use 10-30 for
+               512x512 inputs.
+    """
+
+    def __init__(self, sigma: float = 15.0):
+        self.sigma = sigma
+
+    def __call__(self, sample):
+        image, eye, label = sample['image'], sample['eye'], sample['label']
+        if image.dtype != np.uint8:
+            image = (np.clip(image, 0.0, 1.0) * 255).astype(np.uint8)
+        blurred = cv2.GaussianBlur(image, (0, 0), self.sigma)
+        image = cv2.addWeighted(image, 4, blurred, -4, 128)
+        image = np.clip(image, 0, 255).astype(np.uint8)
+        return {'image': image, 'eye': eye, 'label': label}
+
+
+class RandomCutout:
+    """Randomly erase n_holes square patches to force holistic feature use.
+
+    Applied before ToTensor on float64 [0,1] images.
+
+    Args:
+        n_holes:    number of patches to erase per image.
+        patch_size: side length in pixels of each erased square.
+        fill_value: fill color (0.5 = mid-gray for float images).
+    """
+
+    def __init__(self, n_holes: int = 2, patch_size: int = 32,
+                 fill_value: float = 0.5):
+        self.n_holes = n_holes
+        self.patch_size = patch_size
+        self.fill_value = fill_value
+
+    def __call__(self, sample):
+        image, eye, label = sample['image'], sample['eye'], sample['label']
+        h, w = image.shape[:2]
+        half = self.patch_size // 2
+        image = image.copy()
+        for _ in range(self.n_holes):
+            cy = np.random.randint(0, h)
+            cx = np.random.randint(0, w)
+            y1, y2 = max(cy - half, 0), min(cy + half, h)
+            x1, x2 = max(cx - half, 0), min(cx + half, w)
+            image[y1:y2, x1:x2] = self.fill_value
+        return {'image': image, 'eye': eye, 'label': label}
+
+
+class PerImageNormalize:
+    """Per-channel zero-mean unit-variance normalization on a float32 tensor.
+
+    Must follow ToTensor (operates on (C, H, W) float32 tensors).
+    Handles variable retinal illumination without requiring dataset-wide stats.
+    """
+
+    def __call__(self, sample):
+        image, eye, label = sample['image'], sample['eye'], sample['label']
+        mean = image.mean(dim=(1, 2), keepdim=True)
+        std  = image.std(dim=(1, 2), keepdim=True).clamp(min=1e-6)
+        image = (image - mean) / std
+        return {'image': image, 'eye': eye, 'label': label}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Custom transforms (numpy-based)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class CropByEye:
-    """Crop the image to the bounding box of the eye, removing black borders.
-
-    Args:
-        threshold: pixel intensity threshold in [0, 1] to segment the eye.
-        border:    extra pixels to expand the bounding box (int or (h, w) tuple).
-    """
+    """Crop the image to the bounding box of the eye, removing black borders."""
 
     def __init__(self, threshold, border):
         self.threshold = threshold
@@ -136,7 +208,7 @@ class Normalize:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# torchvision wrappers (numpy -> PIL -> torchvision transform -> numpy/tensor)
+# torchvision wrappers (numpy -> PIL -> torchvision transform -> numpy)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _to_pil(image):
@@ -152,8 +224,7 @@ class TVCenterCrop:
 
     def __call__(self, sample):
         image, eye, label = sample['image'], sample['eye'], sample['label']
-        image = _to_numpy(self._t(_to_pil(image)))
-        return {'image': image, 'eye': eye, 'label': label}
+        return {'image': _to_numpy(self._t(_to_pil(image))), 'eye': eye, 'label': label}
 
 
 class TVRescale:
@@ -162,8 +233,7 @@ class TVRescale:
 
     def __call__(self, sample):
         image, eye, label = sample['image'], sample['eye'], sample['label']
-        image = _to_numpy(self._t(_to_pil(image)))
-        return {'image': image, 'eye': eye, 'label': label}
+        return {'image': _to_numpy(self._t(_to_pil(image))), 'eye': eye, 'label': label}
 
 
 class TVRandomCrop:
@@ -172,8 +242,7 @@ class TVRandomCrop:
 
     def __call__(self, sample):
         image, eye, label = sample['image'], sample['eye'], sample['label']
-        image = _to_numpy(self._t(_to_pil(image)))
-        return {'image': image, 'eye': eye, 'label': label}
+        return {'image': _to_numpy(self._t(_to_pil(image))), 'eye': eye, 'label': label}
 
 
 class TVRandomHorizontalFlip:
@@ -182,8 +251,7 @@ class TVRandomHorizontalFlip:
 
     def __call__(self, sample):
         image, eye, label = sample['image'], sample['eye'], sample['label']
-        image = _to_numpy(self._t(_to_pil(image)))
-        return {'image': image, 'eye': eye, 'label': label}
+        return {'image': _to_numpy(self._t(_to_pil(image))), 'eye': eye, 'label': label}
 
 
 class TVRandomRotation:
@@ -192,12 +260,11 @@ class TVRandomRotation:
 
     def __call__(self, sample):
         image, eye, label = sample['image'], sample['eye'], sample['label']
-        image = _to_numpy(self._t(_to_pil(image)))
-        return {'image': image, 'eye': eye, 'label': label}
+        return {'image': _to_numpy(self._t(_to_pil(image))), 'eye': eye, 'label': label}
 
 
 class TVColorJitter:
-    def __init__(self, brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05):
+    def __init__(self, brightness=0.2, contrast=0.2, saturation=0.2, hue=0.0):
         self._t = transforms.ColorJitter(
             brightness=brightness, contrast=contrast,
             saturation=saturation, hue=hue,
@@ -205,13 +272,10 @@ class TVColorJitter:
 
     def __call__(self, sample):
         image, eye, label = sample['image'], sample['eye'], sample['label']
-        image = _to_numpy(self._t(_to_pil(image)))
-        return {'image': image, 'eye': eye, 'label': label}
+        return {'image': _to_numpy(self._t(_to_pil(image))), 'eye': eye, 'label': label}
 
 
 class TVToTensor:
-    """numpy float64 (HxWxC) -> torch float32 tensor (CxHxW) via torchvision."""
-
     def __init__(self):
         self._t = transforms.ToTensor()
 
@@ -223,55 +287,52 @@ class TVToTensor:
 
 
 class TVNormalize:
-    """Normalize a float tensor image. Must follow ToTensor/TVToTensor."""
-
     def __init__(self, mean, std):
         self._t = transforms.Normalize(mean=mean, std=std)
 
     def __call__(self, sample):
         image, eye, label = sample['image'], sample['eye'], sample['label']
-        image = self._t(image)
-        return {'image': image, 'eye': eye, 'label': label}
+        return {'image': self._t(image), 'eye': eye, 'label': label}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Ready-made pipelines
 # ─────────────────────────────────────────────────────────────────────────────
 
-IMAGENET_MEAN = [0.485, 0.456, 0.406]
-IMAGENET_STD  = [0.229, 0.224, 0.225]
+def get_train_transforms(img_size=512):
+    """Training pipeline for retinal fundus images.
 
-
-def get_train_transforms(img_size=224):
-    """Training pipeline with data augmentation.
-
-    Rescales to 256 (longer margin) before RandomCrop so every crop position
-    is valid and the network sees shifted views of the fundus.
-    Augmentations chosen for retinal photography:
-      - horizontal flip: anatomically symmetric after eye-mirroring
-      - rotation ±15°: fundus images have no fixed orientation
-      - colour jitter: models inter-device illumination variance
+    Changes vs. previous version:
+    - BenGraham normalization applied first (illumination equalization)
+    - Rotation extended to ±180° (full 360° coverage — retina is rotationally symmetric)
+    - Hue jitter disabled (hue is diagnostically meaningful: red=hemorrhage, yellow=exudate)
+    - RandomCutout added (forces holistic scan instead of memorizing one lesion location)
+    - PerImageNormalize replaces fixed ImageNet stats (retinal images have very different
+      channel distributions — ImageNet stats cause SGD to stall)
     """
-    scale_size = int(img_size * 256 / 224)   # 256 when img_size=224
+    scale_size = int(img_size * 256 / 224)
     return transforms.Compose([
+        BenGraham(sigma=15.0),
         CropByEye(0.10, 1),
         Rescale(scale_size),
         RandomCrop(img_size),
         TVRandomHorizontalFlip(p=0.5),
-        TVRandomRotation(15),
-        TVColorJitter(brightness=0.2, contrast=0.2, saturation=0.1, hue=0.05),
+        TVRandomRotation(180),
+        TVColorJitter(brightness=0.2, contrast=0.2, saturation=0.1, hue=0.0),
+        RandomCutout(n_holes=2, patch_size=32, fill_value=0.5),
         ToTensor(),
-        Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        PerImageNormalize(),
     ])
 
 
-def get_val_transforms(img_size=224):
+def get_val_transforms(img_size=512):
     """Deterministic validation/test pipeline."""
     scale_size = int(img_size * 256 / 224)
     return transforms.Compose([
+        BenGraham(sigma=15.0),
         CropByEye(0.10, 1),
         Rescale(scale_size),
         CenterCrop(img_size),
         ToTensor(),
-        Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        PerImageNormalize(),
     ])

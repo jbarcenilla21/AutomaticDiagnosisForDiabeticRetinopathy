@@ -179,6 +179,111 @@ class _ResBlock(nn.Module):
         return self.relu(x + self.net(x))
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Squeeze-and-Excitation block
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _SEBlock(nn.Module):
+    """Channel-wise attention: suppresses noise channels, amplifies lesion channels.
+
+    Args:
+        channels:  number of input/output feature channels.
+        reduction: bottleneck ratio for the excitation MLP.
+    """
+
+    def __init__(self, channels: int, reduction: int = 16):
+        super().__init__()
+        mid = max(channels // reduction, 4)
+        self.excitation = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(channels, mid, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(mid, channels, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        scale = self.excitation(x).view(x.size(0), x.size(1), 1, 1)
+        return x * scale
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SEResNet9  — ResNet-9 with SE attention, increased capacity, Kaiming init
+# ─────────────────────────────────────────────────────────────────────────────
+# Spatial flow at 512×512:
+#   prep:    3→32  ch   512×512
+#   layer1:  32→64 ch   256×256  (MaxPool)
+#   res1 + SE(64)        256×256
+#   layer2:  64→128 ch  128×128  (MaxPool)
+#   layer3: 128→256 ch   64×64   (MaxPool)
+#   res2 + SE(256)        64×64
+#   GAP → Dropout(0.1) → Linear(256, 1)
+#
+# ~1.8M trainable parameters.
+# Returns raw logits — use BCEWithLogitsLoss or FocalLoss, not BCELoss.
+
+class SEResNet9(nn.Module):
+    """ResNet-9 with Squeeze-and-Excitation attention blocks.
+
+    Key improvements over ResNet9:
+    - SE blocks after each ResBlock for learned channel re-weighting
+    - Extra 128->256 downsampling stage (increases capacity to ~1.8M params)
+    - dropout=0.1 (underfitting phase; raise to 0.3 once train AUC > 0.80)
+    - Kaiming (He) normal initialization on all Conv2d layers
+    """
+
+    def __init__(self, in_channels: int = 3, dropout: float = 0.1):
+        super().__init__()
+
+        self.prep   = _conv_bn_relu(in_channels, 32, kernel_size=3, padding=1)
+
+        self.layer1 = nn.Sequential(
+            _conv_bn_relu(32, 64, kernel_size=3, padding=1),
+            nn.MaxPool2d(2, 2),          # 512 -> 256
+        )
+        self.res1   = _ResBlock(64)
+        self.se1    = _SEBlock(64)
+
+        self.layer2 = nn.Sequential(
+            _conv_bn_relu(64, 128, kernel_size=3, padding=1),
+            nn.MaxPool2d(2, 2),          # 256 -> 128
+        )
+        self.layer3 = nn.Sequential(
+            _conv_bn_relu(128, 256, kernel_size=3, padding=1),
+            nn.MaxPool2d(2, 2),          # 128 -> 64
+        )
+        self.res2   = _ResBlock(256)
+        self.se2    = _SEBlock(256)
+
+        self.gap  = nn.AdaptiveAvgPool2d(1)
+        self.head = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(256, 1),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out',
+                                        nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.prep(x)
+        x = self.layer1(x)
+        x = self.se1(self.res1(x))
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.se2(self.res2(x))
+        x = self.gap(x).flatten(1)
+        return self.head(x)              # (N, 1) raw logit
+
+
 class ResNet9(nn.Module):
     """ResNet-9 adapted for 224×224 input with ~400 k trainable parameters."""
 
@@ -221,6 +326,21 @@ class ResNet9(nn.Module):
 # ─────────────────────────────────────────────────────────────────────────────
 # EnsembleNet — combines both branches
 # ─────────────────────────────────────────────────────────────────────────────
+
+class DenseNetGreen(nn.Module):
+    """DenseNetSmall wrapper that accepts 3-channel input and uses only the green channel.
+
+    Allows using the same 3-channel DataLoader for both base models.
+    Outputs a raw logit — use BCEWithLogitsLoss, not BCELoss.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.backbone = DenseNetSmall(in_channels=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.backbone(x[:, 1:2, :, :])             # (N, 1) logit
+
 
 class EnsembleNet(nn.Module):
     """DenseNetSmall (green channel) + ResNet9 (RGB) probability ensemble.

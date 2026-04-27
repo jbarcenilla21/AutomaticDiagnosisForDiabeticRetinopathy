@@ -9,7 +9,10 @@ from training.losses import FocalLoss
 
 
 def test_focal_equals_bce_when_gamma_zero():
-    """With gamma=0 and alpha=0.5, FocalLoss reduces to standard BCE."""
+    """With gamma=0 and alpha=0.5, FocalLoss(p) = 0.5 * BCE(p).
+    alpha=0.5 applies equal weight to both classes; the 0.5 factor does not
+    affect optimization since it's a constant scale on the loss landscape.
+    """
     torch.manual_seed(0)
     logits  = torch.randn(64)
     targets = torch.randint(0, 2, (64,)).float()
@@ -17,8 +20,8 @@ def test_focal_equals_bce_when_gamma_zero():
     fl  = FocalLoss(gamma=0.0, alpha=0.5)(logits, targets)
     bce = F.binary_cross_entropy_with_logits(logits, targets)
 
-    assert abs(fl.item() - bce.item()) < 1e-4, (
-        f"FocalLoss(gamma=0) = {fl.item():.6f}, BCE = {bce.item():.6f}"
+    assert abs(fl.item() - 0.5 * bce.item()) < 1e-4, (
+        f"FocalLoss(gamma=0, alpha=0.5) = {fl.item():.6f}, 0.5*BCE = {0.5*bce.item():.6f}"
     )
 
 
@@ -49,3 +52,18 @@ def test_focal_loss_is_positive():
     targets = torch.randint(0, 2, (32,)).float()
     loss = FocalLoss(gamma=2.0, alpha=0.5)(logits, targets)
     assert loss.item() > 0
+
+
+def test_alpha_weights_positives_more_when_alpha_high():
+    """alpha > 0.5 should up-weight the positive class relative to negative."""
+    # 4 negatives predicted well, 4 positives predicted well — same difficulty
+    logits  = torch.tensor([-3., -3., -3., -3.,  3.,  3.,  3.,  3.])
+    targets = torch.tensor([ 0.,  0.,  0.,  0.,  1.,  1.,  1.,  1.])
+
+    loss_none = FocalLoss(gamma=0.0, alpha=0.75, reduction='none')(logits, targets)
+    neg_loss = loss_none[:4].mean()
+    pos_loss = loss_none[4:].mean()
+
+    assert pos_loss > neg_loss, (
+        f"alpha=0.75 should weight positives more: pos={pos_loss:.4f}, neg={neg_loss:.4f}"
+    )

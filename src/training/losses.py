@@ -38,15 +38,10 @@ class FocalLoss(nn.Module):
             logits:  (N,) raw unnormalized scores.
             targets: (N,) binary labels {0.0, 1.0}.
         """
-        bce = F.binary_cross_entropy_with_logits(
-            logits, targets, reduction='none'
-        )
-        p_t      = torch.exp(-bce)
-        # alpha_t assigns per-sample class weights; normalising by alpha keeps
-        # the formula consistent with standard BCE when gamma=0 and alpha=0.5.
-        alpha_t  = self.alpha * targets + (1.0 - self.alpha) * (1.0 - targets)
-        alpha_t  = alpha_t / self.alpha
-        loss     = alpha_t * (1.0 - p_t) ** self.gamma * bce
+        bce     = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+        p_t     = torch.exp(-bce)
+        alpha_t = self.alpha * targets + (1.0 - self.alpha) * (1.0 - targets)
+        loss    = alpha_t * (1.0 - p_t) ** self.gamma * bce
 
         if self.reduction == 'mean':
             return loss.mean()

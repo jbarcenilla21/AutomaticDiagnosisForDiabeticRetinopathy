@@ -4,9 +4,9 @@ All transforms are callable objects that accept and return a sample dict:
     {'image': np.ndarray (HxWxC), 'eye': int, 'label': int/tensor}
 
 Pipeline order:
-  Train: BenGraham -> CropByEye -> Rescale -> RandomCrop -> augmentation
+  Train: CropByEye -> BenGraham -> Rescale -> RandomCrop -> augmentation
          -> RandomCutout -> ToTensor -> PerImageNormalize
-  Val:   BenGraham -> CropByEye -> Rescale -> CenterCrop
+  Val:   CropByEye -> BenGraham -> Rescale -> CenterCrop
          -> ToTensor -> PerImageNormalize
 """
 
@@ -312,8 +312,8 @@ def get_train_transforms(img_size=512):
     """
     scale_size = int(img_size * 256 / 224)
     return transforms.Compose([
-        BenGraham(sigma=15.0),
         CropByEye(0.10, 1),
+        BenGraham(sigma=15.0),
         Rescale(scale_size),
         RandomCrop(img_size),
         TVRandomHorizontalFlip(p=0.5),
@@ -329,8 +329,8 @@ def get_val_transforms(img_size=512):
     """Deterministic validation/test pipeline."""
     scale_size = int(img_size * 256 / 224)
     return transforms.Compose([
-        BenGraham(sigma=15.0),
         CropByEye(0.10, 1),
+        BenGraham(sigma=15.0),
         Rescale(scale_size),
         CenterCrop(img_size),
         ToTensor(),

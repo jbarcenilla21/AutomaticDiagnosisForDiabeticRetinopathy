@@ -38,13 +38,12 @@ def test_ben_graham_clips_to_valid_range():
     assert out.max() <= 255
 
 
-def test_ben_graham_reduces_std_vs_original():
-    """Ben Graham equalizes illumination — the global channel std should not INCREASE."""
+def test_ben_graham_output_is_uint8():
+    """BenGraham always outputs a uint8 array regardless of input content."""
     img = _fake_uint8(128, 128)
     out = BenGraham(sigma=15.0)(_sample(img))['image']
-    # The background pixels (0,0,0) will be mapped to ~128; std across all pixels may
-    # change; we just verify the transform runs and output is uint8.
     assert out.dtype == np.uint8
+    assert out.shape == img.shape
 
 
 def test_random_cutout_shape_unchanged():

@@ -44,8 +44,7 @@ def test_model(model, test_loader, device):
     with torch.no_grad():
         for sample in test_loader:
             inputs = sample['image'].to(device).float()
-            outputs = model(inputs)
-            outputs = outputs.view(-1, 1)
+            outputs = torch.sigmoid(model(inputs)).view(-1, 1)
             all_outputs.append(outputs.cpu().numpy())
 
     return np.concatenate(all_outputs, axis=0)

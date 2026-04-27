@@ -32,6 +32,9 @@ EnsembleModel
 """
 
 from __future__ import annotations
+from pathlib import Path
+from src.model_components import CustomVGG, SimpleLeNet
+import os
 
 import torch
 import torch.nn as nn
@@ -228,6 +231,7 @@ class EnsembleModel(nn.Module):
         pretrained:     Load ImageNet weights for string-based members.
         weights:        Optional initial weights [w0, w1, ...].  Uniform if None.
                         These are the raw (pre-softmax) values of ens_weights.
+        pth_path:       Optional path to load a checkpoint state_dict for the ensemble.
     """
 
     _DEFAULT_BACKBONES = [
@@ -238,13 +242,32 @@ class EnsembleModel(nn.Module):
 
     def __init__(
         self,
-        backbone_names: list | None          = None,
-        unfreeze_n:     int                  = cfg.unfreeze_layers,
-        pretrained:     bool                 = True,
-        weights:        list[float] | None   = None,
+        backbone_names: list | None         = None,
+        unfreeze_n:     int                 = cfg.unfreeze_layers,
+        pretrained:     bool                = True,
+        weights:        list[float] | None  = None,
+        pth_path:       Path | None         = None,
     ):
         super().__init__()
 
+        # Load arquitecture
+        self._load_from_scratch(backbone_names, pretrained, unfreeze_n, weights)
+        
+        # Load checkpoint if provided
+        if pth_path is not None and os.path.exists(pth_path):
+            print(f"[EnsembleModel] Loading checkpoint from {pth_path}...")
+            state_dict = torch.load(pth_path, map_location="cpu")
+            self.load_state_dict(state_dict)
+
+        total_trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        print(
+            f"[EnsembleModel] Members   : {self.member_names}\n"
+            f"[EnsembleModel] Scales    : {cfg.ensemble_scales}\n"
+            f"[EnsembleModel] Trainable : {total_trainable:,}"
+        )
+    # ── load functioanlity ────────────────────────────────────────────────────
+
+    def _load_from_scratch(self, backbone_names, pretrained, unfreeze_n, weights):
         if backbone_names is None:
             backbone_names = list(self._DEFAULT_BACKBONES)
 
@@ -260,13 +283,17 @@ class EnsembleModel(nn.Module):
                 members.append(spec)
                 names.append(type(spec).__name__)
 
-            elif isinstance(spec, str) and spec.lower() == "custom_vgg":
-                from src.model_components import Custom_VGG
-                m = Custom_VGG(img_size=cfg.img_height)
+            elif isinstance(spec, str) and spec.lower() == "customvgg":
+                m = CustomVGG(img_size=cfg.img_height)
                 members.append(m)
-                names.append("Custom_VGG")
+                names.append("customVGG")
 
-            elif isinstance(spec, str):
+            elif isinstance(spec, str) and spec.lower() == "simplelenet":
+                m = SimpleLeNet(img_size=cfg.img_height)
+                members.append(m)
+                names.append("simpleLeNet")
+
+            elif isinstance(spec, str) and pretrained == True:
                 # Handle missing timm for TinyViT gracefully
                 _spec = spec
                 if not TIMM_AVAILABLE and "tiny_vit" in spec.lower():
@@ -284,7 +311,6 @@ class EnsembleModel(nn.Module):
                 raise TypeError(
                     f"backbone_names elements must be str or nn.Module, got {type(spec)}."
                 )
-
         self.members_list = nn.ModuleList(members)
         self.member_names = names      # human-readable labels for diagnostics
 
@@ -299,14 +325,30 @@ class EnsembleModel(nn.Module):
             w = torch.zeros(n, dtype=torch.float32)
         # nn.Parameter → included in model.parameters() and optimiser updates
         self.ens_weights = nn.Parameter(w)
+    
 
-        total_trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        print(
-            f"[EnsembleModel] Members   : {self.member_names}\n"
-            f"[EnsembleModel] Scales    : {cfg.ensemble_scales}\n"
-            f"[EnsembleModel] Trainable : {total_trainable:,}"
-        )
+    def _load_from_checkpoint(self, pth_path: Path):
+        checkpoint = torch.load(pth_path, map_location=cfg.device)
 
+        if isinstance(checkpoint, dict):
+            if "state_dict" in checkpoint:
+                state_dict = checkpoint["state_dict"]
+            elif "model" in checkpoint:
+                state_dict = checkpoint["model"]
+            else:
+                state_dict = checkpoint
+        else:
+            raise ValueError("Unsupported checkpoint format")
+
+        # limpiar DataParallel
+        state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+
+        missing, unexpected = self.load_state_dict(state_dict, strict=False)
+
+        print("[EnsembleModel] Checkpoint loaded")
+        print(f"  Missing keys   : {len(missing)}")
+        print(f"  Unexpected keys: {len(unexpected)}")
+    
     # ── Forward ───────────────────────────────────────────────────────────────
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

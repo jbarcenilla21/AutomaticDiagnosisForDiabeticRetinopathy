@@ -19,15 +19,16 @@ class Config:
     # ── Hardware & paths ──────────────────────────────────────────────────────
     device = "cuda" if is_available() else "cpu"
 
-    base_dir       = Path(__file__).resolve().parent.parent
-    checkpoint_dir = base_dir / "results" / "checkpoints"
-    results_dir    = base_dir / "results"
-    output_dir     = base_dir / "results" / "outputs"
-    train_csv      = base_dir / "data" / "train.csv"
-    val_csv        = base_dir / "data" / "val.csv"
-    test_csv       = base_dir / "data" / "test.csv"
-    data_dir       = base_dir / "data"
-    images_dir     = base_dir / "data" / "images"
+    base_dir        = Path(__file__).resolve().parent.parent
+    checkpoint_name = Path("best_model.pth")  # default checkpoint filename
+    checkpoint_dir  = base_dir / "results" / "checkpoints"
+    results_dir     = base_dir / "results"
+    output_dir      = base_dir / "results" / "outputs"
+    train_csv       = base_dir / "data" / "train.csv"
+    val_csv         = base_dir / "data" / "val.csv"
+    test_csv        = base_dir / "data" / "test.csv"
+    data_dir        = base_dir / "data"
+    images_dir      = base_dir / "data" / "images"
 
     # ── Multi-scale ensemble resolution (one scale per member) ───────────────
     # Model A: 224×224 — global context  (low-res, broad features)
@@ -97,8 +98,9 @@ class CustomConfig(Config):
     early_stopping  = 15
     batch_size      = 16
 
-    checkpoint_dir = Config.base_dir / "results" / "checkpoints" / "custom"
-    output_path    = Config.output_dir / "output_custom.csv"
+    checkpoint_dir  = Config.base_dir / "results" / "checkpoints" / "custom"
+    checkpoint_name = "multiRes_custom_ensemble.pth"
+    output_path     = Config.output_dir / "output_custom.csv"
 
 
 # =============================================================================
@@ -115,5 +117,6 @@ class FineTuneConfig(Config):
     early_stopping  = 10
     batch_size      = 16        # 512×512 needs smaller batches than 224×224
 
-    checkpoint_dir = Config.base_dir / "results" / "checkpoints" / "finetune"
-    output_path    = Config.output_dir / "output_ft.csv"
+    checkpoint_dir  = Config.base_dir / "results" / "checkpoints" / "finetune"
+    checkpoint_name = "multi_resolution_ensemble.pth"
+    output_path     = Config.output_dir / "output_ft.csv"

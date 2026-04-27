@@ -9,10 +9,10 @@ import torch.nn.functional as F
 
 
 # =============================================================================
-# Custom_VGG  —  Lightweight VGG-style CNN (Custom track)
+# CustomVGG  —  Lightweight VGG-style CNN (Custom track)
 # =============================================================================
 
-class Custom_VGG(nn.Module):
+class CustomVGG(nn.Module):
     """Simplified VGG-style CNN for DR binary classification.
 
     Uses stacked 3×3 convolutions (VGG philosophy) to increase receptive field
@@ -32,14 +32,14 @@ class Custom_VGG(nn.Module):
         # MaxPool2d(2, 2) halves it between blocks.
         self.features = nn.Sequential(
             # Block 1: img_size → img_size/2
-            self._make_vgg_block(3,   32,  num_convs=2),
+            self._make_vgg_block(3,   16,  num_convs=2),
             # Block 2: img_size/2 → img_size/4
-            self._make_vgg_block(32,  64,  num_convs=2),
+            self._make_vgg_block(16,  32,  num_convs=2),
             # Block 3: img_size/4 → img_size/8
-            self._make_vgg_block(64,  128, num_convs=3),
+            self._make_vgg_block(32,  64, num_convs=3),
             # Block 4: img_size/8 → img_size/16
-            self._make_vgg_block(128, 256, num_convs=3),
-            # Adaptive pool → always (B, 256, 7, 7) regardless of img_size
+            self._make_vgg_block(64,  128, num_convs=3),
+            # Adaptive pool → always (B, 128, 7, 7) regardless of img_size
             nn.AdaptiveAvgPool2d((7, 7)),
         )
 
@@ -52,19 +52,16 @@ class Custom_VGG(nn.Module):
         # Returns a raw logit — sigmoid is applied externally by the loss.
         self.classifier = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(flat_size, 512),
+            nn.Linear(flat_size, 128),
             nn.ReLU(inplace=True),
-            nn.Dropout(p=0.5),
-            nn.Linear(512, 512),
-            nn.ReLU(inplace=True),
-            nn.Dropout(p=0.5),
-            nn.Linear(512, num_classes),   # raw logit
+            nn.Dropout(p=0.4),
+            nn.Linear(128, num_classes),   # raw logit
         )
 
         self._init_weights()
 
         total = sum(p.numel() for p in self.parameters())
-        print(f"[Custom_VGG] img_size={img_size} | flat={flat_size:,} | total_params={total:,}")
+        print(f"[CustomVGG] img_size={img_size} | flat={flat_size:,} | total_params={total:,}")
 
     # ── Helper builders ───────────────────────────────────────────────────────
 
@@ -108,6 +105,50 @@ class Custom_VGG(nn.Module):
         x = self.classifier(x)
         return x
 
+class SimpleLeNet(nn.Module):
+    """Very small CNN inspired by LeNet-5, adapted for RGB medical images."""
+    def __init__(self, img_size: int = 512, num_classes: int = 1):
+        super().__init__()
+
+        # ── Feature extractor ────────────────────────────────────────────────
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 16, kernel_size=5, stride=1, padding=2),
+            nn.ReLU(),
+            nn.MaxPool2d(2),   # /2
+
+            nn.Conv2d(16, 32, kernel_size=5, stride=1, padding=2),
+            nn.ReLU(),
+            nn.MaxPool2d(2),   # /4
+
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),   # /8
+
+            nn.AdaptiveAvgPool2d((2, 2))  # keep VERY small
+        )
+
+        # ── Compute flattened size ───────────────────────────────────────────
+        with torch.no_grad():
+            dummy = torch.zeros(1, 3, img_size, img_size)
+            flat_size = self.features(dummy).view(1, -1).size(1)
+
+        # ── Classifier (tiny) ────────────────────────────────────────────────
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(flat_size, 128),
+            nn.ReLU(),
+
+            nn.Linear(128, num_classes)
+        )
+
+        total = sum(p.numel() for p in self.parameters())
+        print(f"[SimpleLeNet] params={total:,}")
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.classifier(x)
+        return x
+
 
 # =============================================================================
 # FocalLoss  —  Binary Focal Loss (handles both logits and probabilities)
@@ -126,7 +167,7 @@ class FocalLoss(nn.Module):
                      class receives 0.25× the base weight.
         gamma:       Focusing exponent ≥ 0.  Higher = more focus on hard examples.
                      gamma=0 reduces to standard BCE (no focusing).
-        from_logits: If True  → inputs are raw logits  (use with BaseModel / Custom_VGG).
+        from_logits: If True  → inputs are raw logits  (use with BaseModel / CustomVGG).
                      If False → inputs are probabilities (use with EnsembleModel,
                                 which applies sigmoid internally).
     """

@@ -6,10 +6,12 @@
 
 ## Individual Contributions
 
-| Member | Responsibility |
-|--------|---------------|
-| Jorge Barcenilla | Model 1 (Custom): SEResNet9, BenGraham + PerImageNormalize + RandomCutout pipeline, FocalLoss + WeightedRandomSampler + SequentialLR warmup, test suite, modular `src/` architecture. |
-| Santiago Prieto | Model 2 (Fine-Tuning): DualChannelEnhancement (dual-channel CLAHE), EfficientNet-B2 + DenseNet-121 multi-scale ensemble with learnable weights, FocalLoss + WeightedRandomSampler, TTA (10 passes), modular `src/`, `uitls/` structure.  |
+Both members contributed jointly to the overall system design, experimental decisions, and final integration. Responsibilities were divided by track to parallelise development, but all major choices were discussed and validated together.
+
+| Member | Primary Track | Key Contributions |
+|--------|--------------|-------------------|
+| Jorge Barcenilla | Model 1 (Custom) | SEResNet9 architecture, BenGraham + PerImageNormalize + RandomCutout preprocessing pipeline, FocalLoss + WeightedRandomSampler + SequentialLR warmup, modular `src/` codebase and test suite. |
+| Santiago Prieto | Model 2 (Fine-Tuning) | DualChannelEnhancement (dual-channel CLAHE), EfficientNet-B2 + DenseNet-121 multi-scale ensemble with learnable Softmax weights, FocalLoss + WeightedRandomSampler, TTA (10 passes), modular `src/` and `utils/` structure. |
 
 ---
 
@@ -49,10 +51,7 @@ Geometric transforms (flips, anatomically plausible rotations of ±30°) and `Co
 
 ### Architecture — Multi-Scale Heterogeneous Ensemble
 
-The ensemble combines **EfficientNet-B2** and **DenseNet-121**, pretrained on ImageNet, with the **last three layer groups of each backbone unfrozen** at initialization, while all earlier layers remain frozen throughout training. Transfer learning is essential given the scarcity of labeled medical data: low-level filters learned on ImageNet transfer effectively and accelerate convergence.
-The key technique is **multi-scale input**. We implement a 6-model ensemble consisting of 3 EfficientNet-B2 and 3 DenseNet-121 models, with one model per resolution (224, 384, 512). This approach enhances lesion detection across different scales and also increases ensemble diversity.
-The final prediction is obtained using a weighted aggregation of sigmoid probabilities.
-
+The ensemble combines **EfficientNet-B2** and **DenseNet-121**, pretrained on ImageNet, with the **last three layer groups of each backbone unfrozen** at initialisation while all earlier layers remain frozen throughout training. Transfer learning is essential given the scarcity of labelled medical data: low-level filters learned on ImageNet transfer effectively and accelerate convergence. The key technique is **multi-scale input**: EfficientNet-B2 receives the image interpolated to 224 px (global context), DenseNet-121 receives it at 512 px (fine lesion detail), promoting feature complementarity between the two architectures. **Ensemble weights are learnable parameters** (`nn.Parameter` normalised with Softmax): the network dynamically learns which architecture and scale are more reliable for the final prediction.
 
 ### Class Imbalance and Training
 
@@ -62,27 +61,19 @@ As in the Custom track, `WeightedRandomSampler` (50/50 batches) and `FocalLoss(�
 
 10 stochastic passes with random flips and rotations over each test image; the output probabilities are averaged. TTA reduces prediction variance on unseen data, providing statistical robustness equivalent to a temporal micro-ensemble over the same image.
 
-### Results
+### Results — Per-Model and Ensemble Performance
 
-**Per-model performance (AUC):**
+| Model | Resolution | Val AUC |
+|-------|:----------:|:-------:|
+| EfficientNet-B2 | 224 px | 0.6044 |
+| EfficientNet-B2 | 384 px | 0.6712 |
+| EfficientNet-B2 | 512 px | 0.6385 |
+| DenseNet-121 | 224 px | 0.7316 |
+| DenseNet-121 | 384 px | 0.8011 |
+| DenseNet-121 | 512 px | 0.8095 |
+| **Full ensemble** | 224 / 512 px | **0.8413** |
 
-| Model                  | Resolution | AUC    |
-|------------------------|------------|--------|
-| EfficientNet-B2        | 224        | 0.6044 |
-| EfficientNet-B2        | 384        | 0.6712 |
-| EfficientNet-B2        | 512        | 0.6385 |
-| DenseNet-121           | 224        | 0.7316 |
-| DenseNet-121           | 384        | 0.8011 |
-| DenseNet-121           | 512        | 0.8095 |
-
-**Ensemble performance:**
-
-| Metric                 | Value  |
-|------------------------|--------|
-| Final Ensemble AUC     | 0.8413 |
-| Codabench AUC          | 0.8189 |
-
-The ensemble outperforms all individual models, demonstrating the benefit of combining heterogeneous architectures and multi-scale inputs.
+The ensemble outperforms all individual models, demonstrating the benefit of combining heterogeneous architectures and multi-scale inputs. **Codabench AUC = 0.8189**.
 
 ---
 
@@ -120,8 +111,8 @@ The ensemble outperforms all individual models, demonstrating the benefit of com
 
 | Metric | Custom (SEResNet9) | Fine-Tuning Ensemble |
 |--------|:-----------------:|:-------------------:|
-| Val AUC (best, local) | 0.7292 (ep. 53) | — |
-| **Codabench AUC (public test)** | **0.74** | **0.81** |
+| Val AUC (best, local) | 0.7292 (ep. 53) | 0.8413 |
+| **Codabench AUC (public test)** | **0.74** | **0.8189** |
 | Trainable parameters | ~1.65 M | ~14 M (EfficientNet-B2 + DenseNet-121) |
 | Training epochs (max) | 60 (early stop p=15) | 50 (early stop p=10) |
 | Input resolution | 512×512 | 224 px / 512 px (multi-scale) |
@@ -132,7 +123,7 @@ The ensemble outperforms all individual models, demonstrating the benefit of com
 
 ## Proposed Figures
 
-1. **Figure 1 — ROC curves (both models)**: validation ROC curves of SEResNet9 (Custom, AUC=0.74) and Multi-Scale Ensemble (Fine-Tune, AUC=0.81) overlaid on the same plot, with the random baseline (AUC=0.50) as reference. Directly compares the discriminative capacity of both approaches.
+1. **Figure 1 — ROC curves (both models)**: validation ROC curves of SEResNet9 (Custom, AUC=0.74) and Multi-Scale Ensemble (Fine-Tune, AUC=0.8189) overlaid on the same plot, with the random baseline (AUC=0.50) as reference. Directly compares the discriminative capacity of both approaches.
 
 2. **Figure 2 — Prediction score distribution by class**: histogram of predicted probabilities on the validation set, split by ground-truth class (No DR / DR), for each model. Shows the degree of class separation and output score calibration of both systems.
 

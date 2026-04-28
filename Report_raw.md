@@ -49,7 +49,10 @@ Geometric transforms (flips, anatomically plausible rotations of ±30°) and `Co
 
 ### Architecture — Multi-Scale Heterogeneous Ensemble
 
-The ensemble combines **EfficientNet-B2** and **DenseNet-121**, pretrained on ImageNet, with the **last three layer groups of each backbone unfrozen** at initialisation while all earlier layers remain frozen throughout training. Transfer learning is essential given the scarcity of labelled medical data: low-level filters learned on ImageNet transfer effectively and accelerate convergence. The key technique is **multi-scale input**: EfficientNet-B2 receives the image interpolated to 224 px (global context), DenseNet-121 receives it at 512 px (fine lesion detail), promoting feature complementarity between the two architectures. **Ensemble weights are learnable parameters** (`nn.Parameter` normalised with Softmax): the network dynamically learns which architecture and scale are more reliable for the final prediction.
+The ensemble combines **EfficientNet-B2** and **DenseNet-121**, pretrained on ImageNet, with the **last three layer groups of each backbone unfrozen** at initialization, while all earlier layers remain frozen throughout training. Transfer learning is essential given the scarcity of labeled medical data: low-level filters learned on ImageNet transfer effectively and accelerate convergence.
+The key technique is **multi-scale input**. We implement a 6-model ensemble consisting of 3 EfficientNet-B2 and 3 DenseNet-121 models, with one model per resolution (224, 384, 512). This approach enhances lesion detection across different scales and also increases ensemble diversity.
+The final prediction is obtained using a weighted aggregation of sigmoid probabilities.
+
 
 ### Class Imbalance and Training
 
@@ -59,7 +62,27 @@ As in the Custom track, `WeightedRandomSampler` (50/50 batches) and `FocalLoss(�
 
 10 stochastic passes with random flips and rotations over each test image; the output probabilities are averaged. TTA reduces prediction variance on unseen data, providing statistical robustness equivalent to a temporal micro-ensemble over the same image.
 
-**Result:** Codabench AUC = **0.81**.
+### Results
+
+**Per-model performance (AUC):**
+
+| Model                  | Resolution | AUC    |
+|------------------------|------------|--------|
+| EfficientNet-B2        | 224        | 0.6044 |
+| EfficientNet-B2        | 384        | 0.6712 |
+| EfficientNet-B2        | 512        | 0.6385 |
+| DenseNet-121           | 224        | 0.7316 |
+| DenseNet-121           | 384        | 0.8011 |
+| DenseNet-121           | 512        | 0.8095 |
+
+**Ensemble performance:**
+
+| Metric                 | Value  |
+|------------------------|--------|
+| Final Ensemble AUC     | 0.8413 |
+| Codabench AUC          | 0.8189 |
+
+The ensemble outperforms all individual models, demonstrating the benefit of combining heterogeneous architectures and multi-scale inputs.
 
 ---
 

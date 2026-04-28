@@ -1,50 +1,117 @@
-# Training hyperparameters
+# =============================================================================
+# config.py  —  Global configuration for DR classification pipeline
+# =============================================================================
+"""
+Three configuration classes:
+  Config         — shared base defaults
+  CustomConfig   — from-scratch training (no pretrained weights, SEResNet9)
+  FineTuneConfig — transfer learning from ImageNet pretrained models (EnsembleModel)
+"""
 
-# ── Image dimensions ──────────────────────────────────────────────────────────
-# 512×512: 4× more pixels than 224 — critical for detecting small DR lesions
-# (microaneurysms, haemorrhages) that get lost at lower resolutions.
-img_height   = 512
-img_width    = 512
-num_channels = 3
+from pathlib import Path
+from torch.cuda import is_available
 
-# ── Fine-tune / legacy CustomNet (SGD) ───────────────────────────────────────
-learning_rate = 1e-2
-batch_size    = 32
-num_epochs    = 50
-lr_step_size  = 10
-lr_gamma      = 0.1
-momentum      = 0.9
 
-# ── Class imbalance ──────────────────────────────────────────────────────────
-# Train set: 1468 negatives / 532 positives → ratio 2.759.
-# Used as pos_weight in BCEWithLogitsLoss so each positive sample weighs 2.76×.
-pos_weight = 2.759
+class Config:
 
-# ── Base models: DenseNetGreen + ResNet9 (Adam + AMP) ────────────────────────
-# Tuned for A100 / H100 (≥80 GB GPU RAM, ≥100 GB system RAM).
-base_lr            = 1e-3
-base_weight_decay  = 1e-4
-base_batch_size    = 64     # comfortably fits 512×512 on 80 GB GPU
-base_val_batch     = 128    # no gradients → can double the batch
-base_num_epochs    = 60
-base_cosine_tmax   = 60     # CosineAnnealingLR period = full training run
-base_cosine_etamin = 1e-6
+    # ── Hardware & paths ──────────────────────────────────────────────────────
+    device = "cuda" if is_available() else "cpu"
 
-# ── LR warmup ────────────────────────────────────────────────────────────────
-# Start at lr * 0.01 and scale linearly to lr over the first 5 epochs before
-# handing off to CosineAnnealingLR. Prevents gradient explosion at random init.
-warmup_epochs       = 5
-warmup_start_factor = 0.01
+    base_dir        = Path(__file__).resolve().parent.parent.parent
+    checkpoint_name = Path("best_model.pth")
+    checkpoint_dir  = base_dir / "results" / "checkpoints"
+    results_dir     = base_dir / "results"
+    output_dir      = base_dir / "results" / "outputs"
+    train_csv       = base_dir / "data" / "train.csv"
+    val_csv         = base_dir / "data" / "val.csv"
+    test_csv        = base_dir / "data" / "test.csv"
+    data_dir        = base_dir / "data"
+    images_dir      = base_dir / "data" / "images"
 
-base_num_workers   = 4
-use_amp            = True   # mixed-precision: ~2-3× speedup on A100
+    # ── Multi-scale ensemble resolution (one scale per member) ───────────────
+    ensemble_scales = [224, 384, 512]
 
-# Legacy names kept for fine-tune track
-ensemble_lr           = base_lr
-ensemble_weight_decay = base_weight_decay
-ensemble_batch_size   = base_batch_size
-ensemble_val_batch    = base_val_batch
-ensemble_num_epochs   = base_num_epochs
-ensemble_cosine_tmax  = base_cosine_tmax
-ensemble_cosine_etamin = base_cosine_etamin
-ensemble_num_workers  = base_num_workers
+    # ── Data parameters ───────────────────────────────────────────────────────
+    img_height   = 512
+    img_width    = 512
+    num_channels = 3
+    rescale_size = 580
+
+    # ── Training hyperparameters ──────────────────────────────────────────────
+    num_clasess     = 1
+    unfreeze_layers = 2
+    batch_size      = 16
+    num_epochs      = 50
+    learning_rate   = 3e-4
+    weight_decay    = 1e-4
+    lr_patience     = 3
+    lr_factor       = 0.3
+    early_stopping  = 10
+    seed            = 42
+
+    # ── LR warmup (LinearLR → CosineAnnealingLR via SequentialLR) ────────────
+    warmup_epochs       = 5
+    warmup_start_factor = 0.01
+
+    # ── TTA ───────────────────────────────────────────────────────────────────
+    num_tta = 10
+
+    # ── Focal Loss ────────────────────────────────────────────────────────────
+    focal_alpha = 0.25
+    focal_gamma = 2.0
+
+    # ── Augmentation ──────────────────────────────────────────────────────────
+    aug_rigid      = True
+    aug_regularize = True
+    aug_clahe      = True
+    aug_ben_graham = True
+    aug_intensity  = 0.7
+
+    # ── CLAHE ─────────────────────────────────────────────────────────────────
+    clahe_clip = 2.0
+    clahe_grid = (4, 4)
+
+    # ── ImageNet normalization (pretrained backbones) ─────────────────────────
+    pixel_mean = [0.485, 0.456, 0.406]
+    pixel_std  = [0.229, 0.224, 0.225]
+
+
+# =============================================================================
+# CustomConfig  —  SEResNet9, train everything from scratch
+# =============================================================================
+class CustomConfig(Config):
+    pretrained          = False
+    aug_intensity       = 0.9
+    unfreeze_layers     = -1        # train all parameters
+    num_epochs          = 60
+    learning_rate       = 5e-4
+    weight_decay        = 5e-4
+    lr_patience         = 5
+    early_stopping      = 15
+    batch_size          = 16
+    focal_alpha         = 0.5       # balanced (pairs with WeightedRandomSampler)
+    warmup_epochs       = 5
+    warmup_start_factor = 0.01
+
+    checkpoint_dir  = Config.base_dir / "results" / "checkpoints" / "custom"
+    checkpoint_name = "seresnet9_best.pth"
+    output_path     = Config.output_dir / "output_custom.csv"
+
+
+# =============================================================================
+# FineTuneConfig  —  EnsembleModel, ImageNet pretrained + partial fine-tuning
+# =============================================================================
+class FineTuneConfig(Config):
+    pretrained      = True
+    aug_intensity   = 0.6
+    unfreeze_layers = 3
+    num_epochs      = 50
+    learning_rate   = 3e-4
+    weight_decay    = 1e-4
+    lr_patience     = 3
+    early_stopping  = 10
+    batch_size      = 16
+
+    checkpoint_dir  = Config.base_dir / "results" / "checkpoints" / "finetune"
+    checkpoint_name = "multi_resolution_ensemble.pth"
+    output_path     = Config.output_dir / "output_ft.csv"

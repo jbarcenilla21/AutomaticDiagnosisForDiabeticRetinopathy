@@ -1,362 +1,394 @@
-"""Ensemble: DenseNetSmall (green channel) + ResNet-9 (full RGB).
-
-Custom track — no pretrained weights.
-
-Architecture rationale:
-  - DenseNetSmall receives only the green channel (index 1 of RGB).
-    The green channel has the highest contrast for microaneurysms, haemorrhages,
-    and retinal vessels — the primary lesion markers in DR.
-  - ResNet9 receives the full RGB image, capturing colour cues such as exudate
-    yellow and vessel redness that the green channel discards.
-  - The two models have different receptive-field profiles (dense reuse vs
-    skip-connection shortcuts), so their errors are largely uncorrelated.
-  - Final score = mean of the two sigmoid probabilities → BCELoss in trainer.
-
-Input:  (N, 3, H, W)  float32 tensor (normalised with ImageNet stats).
-Output: (N, 1)        float32 tensor of DR probabilities in [0, 1].
+# =============================================================================
+# ensemble_net.py  —  BaseModel (single fine-tuned backbone) + EnsembleModel
+# =============================================================================
 """
+Architecture overview
+─────────────────────
+BaseModel
+    Wraps any torchvision / timm model.  The last ``unfreeze_n`` layer groups
+    are unfrozen; the rest stay frozen.  The classification head is replaced
+    with a single linear output (raw logit for BCEWithLogitsLoss / FocalLoss).
+
+    Supported torchvision backbones:
+        efficientnet_b2, efficientnet_b3, densenet121,
+        mobilenet_v3_large, vgg16, vgg16_bn, resnet50, resnext50_32x4d
+
+    Any timm model is also supported when timm is installed.
+
+EnsembleModel
+    Heterogeneous soft-voting ensemble.  Accepts a list of backbone spec strings,
+    the special string "Custom_VGG", or pre-built nn.Module instances.
+
+    Multi-scale forward pass:
+        Model 0 → interpolated to ensemble_scales[0] = 224 (global context)
+        Model 1 → interpolated to ensemble_scales[1] = 384 (mid-scale)
+        Model 2 → interpolated to ensemble_scales[2] = 512 (fine lesions)
+
+    Ensemble weights are LEARNABLE (nn.Parameter with Softmax normalisation),
+    so the model learns which scale/backbone is most reliable.
+
+    predict_tta(): performs N augmented forward passes (random flips/rotations)
+    and returns the mean probability — used at test time.
+"""
+
+from __future__ import annotations
+from pathlib import Path
+import os
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from torchvision import models
 
+from src.model.custom_net import CustomVGG, SimpleLeNet
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Shared helper
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _conv_bn_relu(in_ch: int, out_ch: int, **kwargs) -> nn.Sequential:
-    return nn.Sequential(
-        nn.Conv2d(in_ch, out_ch, bias=False, **kwargs),
-        nn.BatchNorm2d(out_ch),
-        nn.ReLU(inplace=True),
+try:
+    import timm
+    TIMM_AVAILABLE = True
+except ImportError:
+    TIMM_AVAILABLE = False
+    print(
+        "[ensemble_net.py] WARNING: 'timm' not installed.  "
+        "TinyViT will be replaced by MobileNetV3.\n"
+        "  Install with:  pip install timm"
     )
 
+# Default ensemble scales (one per member); imported by EnsembleModel
+_DEFAULT_ENSEMBLE_SCALES = [224, 384, 512]
+_DEFAULT_NUM_TTA = 10
+_DEFAULT_UNFREEZE_LAYERS = 2
 
-# ─────────────────────────────────────────────────────────────────────────────
-# DenseNet-small  (operates on the green channel — 1-channel input)
-# ─────────────────────────────────────────────────────────────────────────────
-# Spatial flow on 224×224:
-#   Stem: Conv3×3 + MaxPool(2)  →  112×112
-#   Block1 (4 layers, k=12): 32 → 80 ch  |  112×112
-#   Transition1 (×0.5):  80 → 40 ch      |   56×56
-#   Block2 (4 layers, k=12): 40 → 88 ch  |   56×56
-#   Transition2 (×0.5):  88 → 44 ch      |   28×28
-#   Block3 (4 layers, k=12): 44 → 92 ch  |   28×28
-#   GAP → Dropout → Linear(92, 1)
 
-class _DenseLayer(nn.Module):
-    """BN → ReLU → Conv3×3 (no bottleneck, keeps code simple)."""
+# =============================================================================
+# Utility helpers
+# =============================================================================
 
-    def __init__(self, in_channels: int, growth_rate: int):
-        super().__init__()
-        self.layer = nn.Sequential(
-            nn.BatchNorm2d(in_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels, growth_rate, kernel_size=3,
-                      padding=1, bias=False),
+def _count_params(model: nn.Module) -> str:
+    total     = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return f"total={total:,}  trainable={trainable:,}"
+
+
+def _replace_head(model: nn.Module, backbone_name: str, out_features: int = 1) -> nn.Module:
+    """Replace the classification head of common torchvision architectures."""
+    name = backbone_name.lower()
+    if "efficientnet" in name:
+        in_feat = model.classifier[1].in_features
+        model.classifier = nn.Sequential(
+            nn.Dropout(p=0.3, inplace=True),
+            nn.Linear(in_feat, out_features),
         )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.cat([x, self.layer(x)], dim=1)
-
-
-class _DenseBlock(nn.Module):
-    def __init__(self, n_layers: int, in_channels: int, growth_rate: int):
-        super().__init__()
-        layers = []
-        ch = in_channels
-        for _ in range(n_layers):
-            layers.append(_DenseLayer(ch, growth_rate))
-            ch += growth_rate
-        self.block = nn.Sequential(*layers)
-        self.out_channels = ch
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.block(x)
-
-
-class _Transition(nn.Module):
-    """1×1 conv (compression) + 2×2 average pooling."""
-
-    def __init__(self, in_channels: int, compression: float = 0.5):
-        super().__init__()
-        out_channels = int(in_channels * compression)
-        self.layer = nn.Sequential(
-            nn.BatchNorm2d(in_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
-            nn.AvgPool2d(2, 2),
+    elif "densenet" in name:
+        in_feat = model.classifier.in_features
+        model.classifier = nn.Linear(in_feat, out_features)
+    elif "resnet" in name or "resnext" in name:
+        in_feat = model.fc.in_features
+        model.fc = nn.Linear(in_feat, out_features)
+    elif "mobilenet_v3" in name:
+        in_feat = model.classifier[-1].in_features
+        model.classifier[-1] = nn.Linear(in_feat, out_features)
+    elif "vgg" in name:
+        in_feat = model.classifier[6].in_features
+        model.classifier[6] = nn.Linear(in_feat, out_features)
+    elif "vit" in name or "swin" in name:
+        in_feat = model.head.in_features
+        model.head = nn.Linear(in_feat, out_features)
+    else:
+        raise ValueError(
+            f"Unknown backbone '{backbone_name}'.  "
+            "Add a head-replacement branch or subclass BaseModel."
         )
-        self.out_channels = out_channels
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.layer(x)
+    return model
 
 
-class DenseNetSmall(nn.Module):
-    """Lightweight DenseNet for the green channel (1 input channel).
-
-    ~90 k trainable parameters.
-    """
-
-    def __init__(self, in_channels: int = 1, growth_rate: int = 12,
-                 block_layers: tuple = (4, 4, 4)):
-        super().__init__()
-
-        # Stem
-        stem_ch = 32
-        self.stem = nn.Sequential(
-            nn.Conv2d(in_channels, stem_ch, kernel_size=3,
-                      padding=1, bias=False),
-            nn.BatchNorm2d(stem_ch),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),          # 224 → 112
-        )
-
-        # Dense blocks + transitions
-        ch = stem_ch
-        self.block1 = _DenseBlock(block_layers[0], ch, growth_rate)
-        ch = self.block1.out_channels    # 32 + 4*12 = 80
-
-        self.trans1 = _Transition(ch)
-        ch = self.trans1.out_channels    # 40
-
-        self.block2 = _DenseBlock(block_layers[1], ch, growth_rate)
-        ch = self.block2.out_channels    # 40 + 4*12 = 88
-
-        self.trans2 = _Transition(ch)
-        ch = self.trans2.out_channels    # 44
-
-        self.block3 = _DenseBlock(block_layers[2], ch, growth_rate)
-        ch = self.block3.out_channels    # 44 + 4*12 = 92
-
-        self.final_bn = nn.BatchNorm2d(ch)
-        self.gap      = nn.AdaptiveAvgPool2d(1)
-        self.head     = nn.Sequential(
-            nn.Dropout(0.4),
-            nn.Linear(ch, 1),            # raw logit
-        )
-        self._out_ch = ch
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.stem(x)
-        x = self.block1(x)
-        x = self.trans1(x)
-        x = self.block2(x)
-        x = self.trans2(x)
-        x = self.block3(x)
-        x = torch.relu(self.final_bn(x))
-        x = self.gap(x).flatten(1)
-        return self.head(x)              # (N, 1) logit
+def _get_layer_groups(model: nn.Module, backbone_name: str) -> list[nn.Module]:
+    """Return ordered layer groups (coarse → fine) for progressive unfreezing."""
+    name = backbone_name.lower()
+    if "efficientnet" in name:
+        return [model.features[i] for i in range(len(model.features))] + [model.classifier]
+    elif "densenet" in name:
+        return [
+            model.features.conv0,
+            model.features.denseblock1,
+            model.features.denseblock2,
+            model.features.denseblock3,
+            model.features.denseblock4,
+            model.classifier,
+        ]
+    elif "mobilenet_v3" in name:
+        return [model.features, model.classifier]
+    elif "vgg" in name:
+        return [model.features, model.classifier]
+    elif "tiny_vit" in name:
+        return list(model.stages) + [model.head]
+    elif "vit" in name or "swin" in name:
+        return list(model.blocks) + [model.head]
+    else:
+        return list(model.children())
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ResNet-9  (operates on full RGB — 3-channel input)
-# ─────────────────────────────────────────────────────────────────────────────
-# Spatial flow on 224×224:
-#   Prep  : Conv3×3  →  32 ch  |  224×224
-#   Layer1: Conv3×3 + MaxPool  →  64 ch  |  112×112
-#   Res1  : ResBlock(64)                 |  112×112
-#   Layer2: Conv3×3 + MaxPool  → 128 ch  |   56×56
-#   Layer3: Conv3×3 + MaxPool  → 128 ch  |   28×28
-#   Res2  : ResBlock(128)                |   28×28
-#   GAP   → Dropout(0.5) → Linear(128,1)
+# =============================================================================
+# BaseModel  —  single fine-tuned backbone
+# =============================================================================
 
-class _ResBlock(nn.Module):
-    """Two Conv3×3+BN+ReLU layers with an identity skip connection."""
-
-    def __init__(self, channels: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            _conv_bn_relu(channels, channels, kernel_size=3, padding=1),
-            nn.Conv2d(channels, channels, kernel_size=3,
-                      padding=1, bias=False),
-            nn.BatchNorm2d(channels),
-        )
-        self.relu = nn.ReLU(inplace=True)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.relu(x + self.net(x))
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Squeeze-and-Excitation block
-# ─────────────────────────────────────────────────────────────────────────────
-
-class _SEBlock(nn.Module):
-    """Channel-wise attention: suppresses noise channels, amplifies lesion channels.
+class BaseModel(nn.Module):
+    """Single pretrained backbone fine-tuned for binary DR classification.
 
     Args:
-        channels:  number of input/output feature channels.
-        reduction: bottleneck ratio for the excitation MLP.
+        backbone_name: e.g. ``"efficientnet_b2"``, ``"densenet121"``,
+                       or any timm model name.
+        unfreeze_n:    Number of layer groups (from the end) to leave trainable.
+                       -1 → unfreeze the entire network (Custom track).
+        pretrained:    Load ImageNet weights.  False → random init.
     """
 
-    def __init__(self, channels: int, reduction: int = 16):
+    def __init__(
+        self,
+        backbone_name: str  = "efficientnet_b2",
+        unfreeze_n:    int  = _DEFAULT_UNFREEZE_LAYERS,
+        pretrained:    bool = True,
+    ):
         super().__init__()
-        mid = max(channels // reduction, 4)
-        self.excitation = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(channels, mid, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(mid, channels, bias=False),
-            nn.Sigmoid(),
-        )
+        self.backbone_name = backbone_name
+        self.model         = self._build_backbone(backbone_name, pretrained)
+        self._freeze_and_unfreeze(unfreeze_n)
+        print(f"[BaseModel] {backbone_name} | {_count_params(self.model)}")
+
+    def _build_backbone(self, name: str, pretrained: bool) -> nn.Module:
+        weights_arg = "IMAGENET1K_V1" if pretrained else None
+        name_lower  = name.lower()
+
+        if name_lower == "efficientnet_b2":
+            m = models.efficientnet_b2(weights=weights_arg)
+        elif name_lower == "efficientnet_b3":
+            m = models.efficientnet_b3(weights=weights_arg)
+        elif name_lower == "vgg16":
+            m = models.vgg16(weights="IMAGENET1K_V1" if pretrained else None)
+        elif name_lower == "densenet121":
+            m = models.densenet121(weights=weights_arg)
+        elif name_lower == "mobilenet_v3_large":
+            m = models.mobilenet_v3_large(weights=weights_arg)
+        elif TIMM_AVAILABLE:
+            m = timm.create_model(name, pretrained=pretrained, num_classes=1)
+            return m
+        else:
+            raise ValueError(
+                f"Backbone '{name}' requires timm.  "
+                "Install with:  pip install timm"
+            )
+
+        _replace_head(m, name_lower)
+        return m
+
+    def _freeze_and_unfreeze(self, unfreeze_n: int):
+        if unfreeze_n == -1:
+            return
+
+        for p in self.model.parameters():
+            p.requires_grad = False
+
+        groups = _get_layer_groups(self.model, self.backbone_name)
+        print(f"[BaseModel] Total groups: {len(groups)}.  Unfreezing last {unfreeze_n}.")
+        for group in groups[-unfreeze_n:]:
+            for p in group.parameters():
+                p.requires_grad = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        scale = self.excitation(x).view(x.size(0), x.size(1), 1, 1)
-        return x * scale
+        return self.model(x)   # raw logit → (B, 1)
+
+    def unfreeze_all(self):
+        """Unfreeze the full network (call after initial warm-up phase)."""
+        for p in self.model.parameters():
+            p.requires_grad = True
+        print(f"[BaseModel] All layers unfrozen. {_count_params(self.model)}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SEResNet9  — ResNet-9 with SE attention, increased capacity, Kaiming init
-# ─────────────────────────────────────────────────────────────────────────────
-# Spatial flow at 512×512:
-#   prep:    3→32  ch   512×512
-#   layer1:  32→64 ch   256×256  (MaxPool)
-#   res1 + SE(64)        256×256
-#   layer2:  64→128 ch  128×128  (MaxPool)
-#   layer3: 128→256 ch   64×64   (MaxPool)
-#   res2 + SE(256)        64×64
-#   GAP → Dropout(0.1) → Linear(256, 1)
-#
-# ~1.8M trainable parameters.
-# Returns raw logits — use BCEWithLogitsLoss or FocalLoss, not BCELoss.
+# =============================================================================
+# EnsembleModel  —  Heterogeneous multi-scale soft-voting ensemble
+# =============================================================================
 
-class SEResNet9(nn.Module):
-    """ResNet-9 with Squeeze-and-Excitation attention blocks.
+class EnsembleModel(nn.Module):
+    """Multi-scale heterogeneous soft-voting ensemble.
 
-    Key improvements over ResNet9:
-    - SE blocks after each ResBlock for learned channel re-weighting
-    - Extra 128->256 downsampling stage (increases capacity to ~1.8M params)
-    - dropout=0.1 (underfitting phase; raise to 0.3 once train AUC > 0.80)
-    - Kaiming (He) normal initialization on all Conv2d layers
+    Each member receives the input at a DIFFERENT resolution, encouraging
+    complementary feature extraction:
+
+        Member 0  →  224px  (global context)
+        Member 1  →  384px  (mid-scale)
+        Member 2  →  512px  (fine lesions)
+
+    Ensemble weights (``ens_weights``) are ``nn.Parameter`` values; Softmax is
+    applied in forward() so they always sum to 1 and stay positive.
+
+    Args:
+        backbone_names: List of backbone specs (str / ``"CustomVGG"`` / nn.Module).
+                        Defaults to EfficientNet-B2 + DenseNet-121 + TinyViT.
+        unfreeze_n:     Layer groups to unfreeze per string-based member.
+        pretrained:     Load ImageNet weights for string-based members.
+        weights:        Optional initial weights [w0, w1, ...].  Uniform if None.
+        pth_path:       Optional path to load a checkpoint state_dict.
+        ensemble_scales: Resolution per member. Defaults to [224, 384, 512].
     """
 
-    def __init__(self, in_channels: int = 3, dropout: float = 0.1):
+    _DEFAULT_BACKBONES = [
+        "efficientnet_b2",
+        "densenet121",
+        "tiny_vit_21m_224.dist_in22k_ft_in1k",
+    ]
+
+    def __init__(
+        self,
+        backbone_names:  list | None         = None,
+        unfreeze_n:      int                 = _DEFAULT_UNFREEZE_LAYERS,
+        pretrained:      bool                = True,
+        weights:         list[float] | None  = None,
+        pth_path:        Path | None         = None,
+        ensemble_scales: list[int] | None    = None,
+        num_tta:         int                 = _DEFAULT_NUM_TTA,
+    ):
         super().__init__()
+        self.ensemble_scales = ensemble_scales or list(_DEFAULT_ENSEMBLE_SCALES)
+        self.num_tta         = num_tta
 
-        self.prep   = _conv_bn_relu(in_channels, 32, kernel_size=3, padding=1)
+        self._load_from_scratch(backbone_names, pretrained, unfreeze_n, weights)
 
-        self.layer1 = nn.Sequential(
-            _conv_bn_relu(32, 64, kernel_size=3, padding=1),
-            nn.MaxPool2d(2, 2),          # 512 -> 256
-        )
-        self.res1   = _ResBlock(64)
-        self.se1    = _SEBlock(64)
+        if pth_path is not None and os.path.exists(pth_path):
+            print(f"[EnsembleModel] Loading checkpoint from {pth_path}...")
+            state_dict = torch.load(pth_path, map_location="cpu")
+            self.load_state_dict(state_dict)
 
-        self.layer2 = nn.Sequential(
-            _conv_bn_relu(64, 128, kernel_size=3, padding=1),
-            nn.MaxPool2d(2, 2),          # 256 -> 128
-        )
-        self.layer3 = nn.Sequential(
-            _conv_bn_relu(128, 256, kernel_size=3, padding=1),
-            nn.MaxPool2d(2, 2),          # 128 -> 64
-        )
-        self.res2   = _ResBlock(256)
-        self.se2    = _SEBlock(256)
-
-        self.gap  = nn.AdaptiveAvgPool2d(1)
-        self.head = nn.Sequential(
-            nn.Dropout(dropout),
-            nn.Linear(256, 1),
+        total_trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        print(
+            f"[EnsembleModel] Members   : {self.member_names}\n"
+            f"[EnsembleModel] Scales    : {self.ensemble_scales}\n"
+            f"[EnsembleModel] Trainable : {total_trainable:,}"
         )
 
-        self._init_weights()
+    def _load_from_scratch(self, backbone_names, pretrained, unfreeze_n, weights):
+        if backbone_names is None:
+            backbone_names = list(self._DEFAULT_BACKBONES)
 
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out',
-                                        nonlinearity='relu')
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
+        effective_unfreeze = -1 if not pretrained else unfreeze_n
+
+        members: list[nn.Module] = []
+        names:   list[str]       = []
+
+        for spec in backbone_names:
+            if isinstance(spec, nn.Module):
+                members.append(spec)
+                names.append(type(spec).__name__)
+
+            elif isinstance(spec, str) and spec.lower() == "customvgg":
+                members.append(CustomVGG())
+                names.append("customVGG")
+
+            elif isinstance(spec, str) and spec.lower() == "simplelenet":
+                members.append(SimpleLeNet())
+                names.append("simpleLeNet")
+
+            elif isinstance(spec, str) and pretrained:
+                _spec = spec
+                if not TIMM_AVAILABLE and "tiny_vit" in spec.lower():
+                    print(f"[EnsembleModel] timm unavailable — replacing '{spec}' with MobileNetV3.")
+                    _spec = "mobilenet_v3_large"
+                m = BaseModel(
+                    backbone_name = _spec,
+                    unfreeze_n    = effective_unfreeze,
+                    pretrained    = pretrained,
+                )
+                members.append(m)
+                names.append(_spec)
+
+            else:
+                raise TypeError(
+                    f"backbone_names elements must be str or nn.Module, got {type(spec)}."
+                )
+
+        self.members_list = nn.ModuleList(members)
+        self.member_names = names
+
+        n = len(members)
+        if weights is not None:
+            if len(weights) != n:
+                raise ValueError(f"len(weights)={len(weights)} != num members={n}")
+            w = torch.tensor(weights, dtype=torch.float32)
+        else:
+            w = torch.zeros(n, dtype=torch.float32)
+        self.ens_weights = nn.Parameter(w)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.prep(x)
-        x = self.layer1(x)
-        x = self.se1(self.res1(x))
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.se2(self.res2(x))
-        x = self.gap(x).flatten(1)
-        return self.head(x)              # (N, 1) raw logit
+        """Multi-scale weighted-mean probability.  Shape: (B, 1)."""
+        w   = torch.softmax(self.ens_weights, dim=0)
+        out = torch.zeros(x.size(0), 1, device=x.device, dtype=x.dtype)
 
+        for i, member in enumerate(self.members_list):
+            target_res = self.ensemble_scales[i % len(self.ensemble_scales)]
+            x_res = F.interpolate(
+                x, size=(target_res, target_res),
+                mode="bilinear", align_corners=False,
+            )
+            logit = member(x_res)
+            prob  = torch.sigmoid(logit)
+            out   = out + w[i] * prob
 
-class ResNet9(nn.Module):
-    """ResNet-9 adapted for 224×224 input with ~400 k trainable parameters."""
+        return out   # weighted-mean probability in [0, 1]
 
-    def __init__(self, in_channels: int = 3):
-        super().__init__()
+    @torch.no_grad()
+    def predict_tta(self, x: torch.Tensor, n_passes: int | None = None) -> torch.Tensor:
+        """Run N augmented forward passes and return the mean probability."""
+        n_passes = n_passes or self.num_tta
+        self.eval()
+        prob_sum = torch.zeros(x.size(0), 1, device=x.device)
 
-        self.prep   = _conv_bn_relu(in_channels, 32, kernel_size=3, padding=1)
+        for _ in range(n_passes):
+            x_aug = x.clone()
+            if torch.rand(1).item() > 0.5:
+                x_aug = torch.flip(x_aug, dims=[3])
+            if torch.rand(1).item() > 0.5:
+                x_aug = torch.flip(x_aug, dims=[2])
+            k = torch.randint(0, 4, (1,)).item()
+            if k > 0:
+                x_aug = torch.rot90(x_aug, k=k, dims=[2, 3])
+            prob_sum = prob_sum + self.forward(x_aug)
 
-        self.layer1 = nn.Sequential(
-            _conv_bn_relu(32, 64, kernel_size=3, padding=1),
-            nn.MaxPool2d(2, 2),          # 224 → 112
-        )
-        self.res1   = _ResBlock(64)
+        return prob_sum / n_passes
 
-        self.layer2 = nn.Sequential(
-            _conv_bn_relu(64, 128, kernel_size=3, padding=1),
-            nn.MaxPool2d(2, 2),          # 112 → 56
-        )
-        self.layer3 = nn.Sequential(
-            _conv_bn_relu(128, 128, kernel_size=3, padding=1),
-            nn.MaxPool2d(2, 2),          # 56 → 28
-        )
-        self.res2   = _ResBlock(128)
+    def member_logits(self, x: torch.Tensor) -> list[torch.Tensor]:
+        """Raw logits from each member — for per-backbone AUC diagnostics."""
+        logits = []
+        for i, member in enumerate(self.members_list):
+            target_res = self.ensemble_scales[i % len(self.ensemble_scales)]
+            x_res      = F.interpolate(
+                x, size=(target_res, target_res),
+                mode="bilinear", align_corners=False,
+            )
+            logits.append(member(x_res))
+        return logits
 
-        self.gap  = nn.AdaptiveAvgPool2d(1)
-        self.head = nn.Sequential(
-            nn.Dropout(0.5),
-            nn.Linear(128, 1),           # raw logit
-        )
+    def unfreeze_all_members(self):
+        """Unfreeze every parameter in every member (call after warm-up)."""
+        for member in self.members_list:
+            if hasattr(member, "unfreeze_all"):
+                member.unfreeze_all()
+            else:
+                for p in member.parameters():
+                    p.requires_grad = True
+        total = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        print(f"[EnsembleModel] All members unfrozen.  Trainable: {total:,}")
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.prep(x)
-        x = self.res1(self.layer1(x))
-        x = self.layer2(x)
-        x = self.res2(self.layer3(x))
-        x = self.gap(x).flatten(1)
-        return self.head(x)              # (N, 1) logit
+    def members(self) -> list[nn.Module]:
+        return list(self.members_list)
 
+    # ── Backward-compatible property aliases ──────────────────────────────────
 
-# ─────────────────────────────────────────────────────────────────────────────
-# EnsembleNet — combines both branches
-# ─────────────────────────────────────────────────────────────────────────────
+    @property
+    def eff_net(self) -> nn.Module:
+        return self.members_list[0]
 
-class DenseNetGreen(nn.Module):
-    """DenseNetSmall wrapper that accepts 3-channel input and uses only the green channel.
+    @property
+    def dense_net(self) -> nn.Module:
+        return self.members_list[1] if len(self.members_list) > 1 else None
 
-    Allows using the same 3-channel DataLoader for both base models.
-    Outputs a raw logit — use BCEWithLogitsLoss, not BCELoss.
-    """
-
-    def __init__(self):
-        super().__init__()
-        self.backbone = DenseNetSmall(in_channels=1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.backbone(x[:, 1:2, :, :])             # (N, 1) logit
-
-
-class EnsembleNet(nn.Module):
-    """DenseNetSmall (green channel) + ResNet9 (RGB) probability ensemble.
-
-    Each sub-model outputs a raw logit. Sigmoid is applied to each logit and
-    the two probabilities are averaged. The result is in [0, 1], compatible
-    with nn.BCELoss in the trainer.
-    """
-
-    def __init__(self):
-        super().__init__()
-        self.densenet = DenseNetSmall(in_channels=1)
-        self.resnet9  = ResNet9(in_channels=3)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        green = x[:, 1:2, :, :]                          # (N, 1, H, W)
-        prob_d = torch.sigmoid(self.densenet(green))      # (N, 1)
-        prob_r = torch.sigmoid(self.resnet9(x))           # (N, 1)
-        return (prob_d + prob_r) / 2                      # (N, 1) ∈ [0, 1]
+    @property
+    def tiny_vit(self) -> nn.Module:
+        return self.members_list[2] if len(self.members_list) > 2 else None

@@ -4,7 +4,7 @@ import pytest
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
-from model.ensemble_net import SEResNet9
+from model.custom_net import SEResNet9
 
 
 def test_seresnet9_output_shape_small_input():

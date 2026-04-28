@@ -3,11 +3,20 @@
 All transforms are callable objects that accept and return a sample dict:
     {'image': np.ndarray (HxWxC), 'eye': int, 'label': int/tensor}
 
-Pipeline order:
-  Train: CropByEye -> BenGraham -> Rescale -> RandomCrop -> augmentation
-         -> RandomCutout -> ToTensor -> PerImageNormalize
-  Val:   CropByEye -> BenGraham -> Rescale -> CenterCrop
-         -> ToTensor -> PerImageNormalize
+Custom track pipeline (SEResNet9):
+  Train: CropByEye → BenGraham → Rescale → RandomCrop → augmentation
+         → RandomCutout → ToTensor → PerImageNormalize
+  Val:   CropByEye → BenGraham → Rescale → CenterCrop
+         → ToTensor → PerImageNormalize
+
+Fine-tune track pipeline (EnsembleModel):
+  Train: CropByEye → Rescale → DualChannelEnhancement → RandomCrop
+         → flips/rotation → GaussianNoise → ToTensor → Normalize(ImageNet)
+  Val:   CropByEye → Rescale → DualChannelEnhancement → CenterCrop
+         → ToTensor → Normalize(ImageNet)
+
+NOTE: CropByEye MUST precede BenGraham. BenGraham maps black borders to
+gray(128), which breaks CropByEye's brightness-threshold detection.
 """
 
 import numpy as np
@@ -296,6 +305,83 @@ class TVNormalize:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Fine-tune track: CLAHE helpers + DualChannelEnhancement + GaussianNoise
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _apply_clahe_green(image: np.ndarray, clip_limit: float = 2.0,
+                       tile_grid: tuple = (4, 4)) -> np.ndarray:
+    """Apply CLAHE to the green channel of an RGB image (uint8 or float[0,1])."""
+    is_float = image.dtype != np.uint8
+    img_u8   = util.img_as_ubyte(np.clip(image, 0, 1)) if is_float else image.copy()
+    clahe    = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid)
+    out      = img_u8.copy()
+    out[:, :, 1] = clahe.apply(img_u8[:, :, 1])
+    return util.img_as_float(out) if is_float else out
+
+
+def _apply_clahe_red(image: np.ndarray, clip_limit: float = 2.0,
+                     tile_grid: tuple = (4, 4)) -> np.ndarray:
+    """Apply CLAHE to the red channel of an RGB image (uint8 or float[0,1])."""
+    is_float = image.dtype != np.uint8
+    img_u8   = util.img_as_ubyte(np.clip(image, 0, 1)) if is_float else image.copy()
+    clahe    = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid)
+    out      = img_u8.copy()
+    out[:, :, 0] = clahe.apply(img_u8[:, :, 0])
+    return util.img_as_float(out) if is_float else out
+
+
+class DualChannelEnhancement:
+    """Apply masked CLAHE to both green and red channels simultaneously.
+
+    Rationale
+    ─────────
+    • Green channel: highest contrast for micro-aneurysms, exudates, haemorrhages.
+    • Red channel  : highlights neovascularisation and larger haemorrhages.
+    • Strict masking: the black fundus border is preserved by zeroing pixels
+      outside a brightness-derived binary mask AFTER enhancement.
+
+    Used in the Fine-tune track pipeline (EnsembleModel).
+    """
+
+    def __init__(self, mask_threshold: float = 0.05,
+                 clip_limit: float = 2.0, tile_grid: tuple = (4, 4)):
+        self.mask_threshold = mask_threshold
+        self.clip_limit     = clip_limit
+        self.tile_grid      = tile_grid
+
+    def __call__(self, sample: dict) -> dict:
+        image = sample["image"]   # float64 H×W×3 in [0, 1]
+
+        gray = color.rgb2gray(image)
+        mask = (gray > self.mask_threshold).astype(np.float64)
+
+        image = _apply_clahe_green(image, self.clip_limit, self.tile_grid)
+        image = _apply_clahe_red(image,   self.clip_limit, self.tile_grid)
+        image = image * mask[:, :, np.newaxis]
+
+        return {"image": image, "eye": sample["eye"], "label": sample["label"]}
+
+
+class GaussianNoise:
+    """Add zero-mean Gaussian noise to simulate sensor variability.
+
+    Used in the Fine-tune track training pipeline.
+
+    Args:
+        std: standard deviation of the noise (default 0.02 for float images).
+    """
+
+    def __init__(self, std: float = 0.02):
+        self.std = std
+
+    def __call__(self, sample: dict) -> dict:
+        image = sample["image"]
+        noise = np.random.normal(0, self.std, image.shape).astype(image.dtype)
+        image = np.clip(image + noise, 0, 1)
+        return {"image": image, "eye": sample["eye"], "label": sample["label"]}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Ready-made pipelines
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -326,7 +412,7 @@ def get_train_transforms(img_size=512):
 
 
 def get_val_transforms(img_size=512):
-    """Deterministic validation/test pipeline."""
+    """Deterministic validation/test pipeline (Custom track)."""
     scale_size = int(img_size * 256 / 224)
     return transforms.Compose([
         CropByEye(0.10, 1),
@@ -335,4 +421,44 @@ def get_val_transforms(img_size=512):
         CenterCrop(img_size),
         ToTensor(),
         PerImageNormalize(),
+    ])
+
+
+# ImageNet normalization constants for pretrained backbone fine-tuning
+_IMAGENET_MEAN = [0.485, 0.456, 0.406]
+_IMAGENET_STD  = [0.229, 0.224, 0.225]
+
+
+def get_ft_train_transforms(img_size=512):
+    """Training pipeline for the Fine-tune track (EnsembleModel).
+
+    Uses DualChannelEnhancement (CLAHE on green+red) instead of BenGraham,
+    ImageNet normalization (correct for pretrained backbones), and GaussianNoise
+    for sensor variability augmentation.
+    """
+    scale_size = int(img_size * 256 / 224)
+    return transforms.Compose([
+        CropByEye(0.10, 1),
+        Rescale(scale_size),
+        DualChannelEnhancement(mask_threshold=0.05),
+        RandomCrop(img_size),
+        TVRandomHorizontalFlip(p=0.5),
+        TVRandomRotation(30),
+        TVColorJitter(brightness=0.2, contrast=0.2, saturation=0.1, hue=0.05),
+        GaussianNoise(std=0.02),
+        ToTensor(),
+        TVNormalize(mean=_IMAGENET_MEAN, std=_IMAGENET_STD),
+    ])
+
+
+def get_ft_val_transforms(img_size=512):
+    """Deterministic validation/test pipeline for the Fine-tune track."""
+    scale_size = int(img_size * 256 / 224)
+    return transforms.Compose([
+        CropByEye(0.10, 1),
+        Rescale(scale_size),
+        DualChannelEnhancement(mask_threshold=0.05),
+        CenterCrop(img_size),
+        ToTensor(),
+        TVNormalize(mean=_IMAGENET_MEAN, std=_IMAGENET_STD),
     ])

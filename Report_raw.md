@@ -9,7 +9,7 @@
 | Member | Responsibility |
 |--------|---------------|
 | Jorge Barcenilla | Model 1 (Custom): SEResNet9, BenGraham + PerImageNormalize + RandomCutout pipeline, FocalLoss + WeightedRandomSampler + SequentialLR warmup, test suite, modular `src/` architecture. |
-| Santiago Prieto | Model 2 (Fine-Tuning): DualChannelEnhancement (dual-channel CLAHE), EfficientNet-B2 + DenseNet-121 multi-scale ensemble with learnable weights, FocalLoss + WeightedRandomSampler, TTA (10 passes). |
+| Santiago Prieto | Model 2 (Fine-Tuning): DualChannelEnhancement (dual-channel CLAHE), EfficientNet-B2 + DenseNet-121 multi-scale ensemble with learnable weights, FocalLoss + WeightedRandomSampler, TTA (10 passes), modular `src/`, `uitls/` structure.  |
 
 ---
 
